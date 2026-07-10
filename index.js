@@ -26,11 +26,13 @@ app.use((req, _res, next) => {
   next();
 });
 
-const PORT        = process.env.PORT || 4001;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/ThreatIntel';
-const AMASS_BIN   = process.env.AMASS_BIN || '/usr/lib/amass/amass';
+const PORT          = process.env.PORT || 4001;
+const MONGODB_URI   = process.env.MONGODB_URI || 'mongodb://localhost:27017/ThreatIntel';
+const AMASS_BIN     = process.env.AMASS_BIN || '/usr/lib/amass/amass';
 const SUBFINDER_BIN = process.env.SUBFINDER_BIN || '';
+const NMAP_BIN      = process.env.NMAP_BIN || '/usr/bin/nmap';
 const SCAN_TIMEOUT  = parseInt(process.env.SCAN_TIMEOUT_MINUTES || '5', 10);
+const NMAP_TIMEOUT  = parseInt(process.env.NMAP_TIMEOUT_MINUTES || '10', 10);
 
 // ─── minimal schemas (strict:false preserves other fields on upsert) ─────────
 const ScanJob = mongoose.model('ScanJob', new mongoose.Schema({
@@ -89,6 +91,34 @@ function cleanup(...files) {
   }
 }
 
+// Parse nmap normal-format text output (-oN) into structured port objects
+function parseNmapOutput(output) {
+  const results = [];
+  let inPortSection = false;
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.trim();
+    if (/^PORT\s+STATE\s+SERVICE/.test(line)) { inPortSection = true; continue; }
+    if (!inPortSection) continue;
+    if (line === '' || line.startsWith('Service') || line.startsWith('Nmap') || line.startsWith('Warning')) {
+      inPortSection = false;
+      continue;
+    }
+    // e.g. "80/tcp   open  http    nginx 1.18.0"
+    const m = line.match(/^(\d+)\/(tcp|udp)\s+open\s+(\S+)(?:\s+(.+))?$/);
+    if (!m) continue;
+    const [, portStr, protocol, service, version] = m;
+    results.push({
+      port:     parseInt(portStr, 10),
+      protocol,
+      service,
+      version:  (version || '').trim(),
+      state:    'Open',
+      risk:     'Unknown',
+    });
+  }
+  return results;
+}
+
 // ─── tool runners ────────────────────────────────────────────────────────────
 
 // subfinder: fast passive enumeration, outputs one name per line to stdout
@@ -144,11 +174,54 @@ async function runAmass(domain, prefix, jobId) {
   });
 }
 
-// ─── core scanner ─────────────────────────────────────────────────────────────
+// nmap: active port + service scan, writes to temp file then parses
+// scanId must be unique per concurrent call (e.g. `${jobId}_${index}`)
+async function runNmap(target, jobId, scanId) {
+  return new Promise((resolve) => {
+    const id = scanId || jobId;
+    const outFile = path.join(os.tmpdir(), `nmap_${id}.txt`);
+    // -sV: service/version detection, --open: only open ports, -T4: fast timing, top 1000 ports
+    const args = ['-sV', '--open', '-T4', '-oN', outFile, target];
+    const timeoutMs = NMAP_TIMEOUT * 60 * 1000;
+
+    log('scan', jobId, `Executing nmap on ${target}`);
+    const startTime = Date.now();
+
+    const proc = spawn(NMAP_BIN, args);
+    // Suppress per-host nmap output for multi-host scans — logged at summary level
+    proc.stderr.on('data', () => {});
+
+    const killTimer = setTimeout(() => {
+      logErr('scan', jobId, `nmap timed out on ${target} — killing`);
+      proc.kill('SIGTERM');
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      clearTimeout(killTimer);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      let ports = [];
+      if (fs.existsSync(outFile)) {
+        const content = fs.readFileSync(outFile, 'utf8');
+        cleanup(outFile);
+        ports = parseNmapOutput(content);
+      }
+      log('scan', jobId, `nmap [${target}] done in ${elapsed}s | ${ports.length} port(s) open (exit=${code})`);
+      resolve(ports);
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(killTimer);
+      logErr('scan', jobId, `nmap spawn error on ${target}: ${err.message}`);
+      cleanup(outFile);
+      resolve([]);
+    });
+  });
+}
+
+// ─── core scanners ─────────────────────────────────────────────────────────────
 async function runSubdomainScan(domain, tenantId, jobId) {
   log('scan', jobId, `▶ Starting subdomain scan | domain=${domain} tenantId=${tenantId}`);
 
-  // Mark running (upsert: true so direct-to-helper tests also work)
   await ScanJob.findOneAndUpdate(
     { jobId },
     { jobId, tenantId, domain, type: 'subdomains', status: 'running', startedAt: new Date() },
@@ -160,12 +233,10 @@ async function runSubdomainScan(domain, tenantId, jobId) {
   const subfinderAvailable = SUBFINDER_BIN && fs.existsSync(SUBFINDER_BIN);
 
   if (subfinderAvailable) {
-    // ── Fast path: subfinder ───────────────────────────────────────────
     log('scan', jobId, `Tool selected: subfinder (${SUBFINDER_BIN})`);
     names = await runSubfinder(domain, jobId);
     log('scan', jobId, `subfinder produced ${names.length} name(s)`);
   } else {
-    // ── Fallback: amass ────────────────────────────────────────────────
     if (!SUBFINDER_BIN) {
       log('scan', jobId, 'Tool selected: amass (subfinder not configured in .env)');
     } else {
@@ -205,17 +276,15 @@ async function runSubdomainScan(domain, tenantId, jobId) {
 
       cleanup(jsonFile, txtFile);
       log('scan', jobId, `Temp files cleaned: ${jsonFile}`);
-      await saveResults(tenantId, jobId, subdomains);
+      await saveSubdomainResults(tenantId, jobId, subdomains);
       return;
     }
 
-    // txt fallback
     names = parseAmassTxt(txtFile);
     cleanup(jsonFile, txtFile);
     log('scan', jobId, `amass JSON was empty — falling back to txt: ${names.length} names`);
   }
 
-  // Resolve IPs for name-only lists (subfinder / amass txt)
   log('scan', jobId, `Resolving IPs for ${names.length} subdomains in batches of 20...`);
   const BATCH = 20;
   const subdomains = new Array(names.length);
@@ -239,10 +308,84 @@ async function runSubdomainScan(domain, tenantId, jobId) {
 
   const withIp = subdomains.filter(s => s.ip).length;
   log('scan', jobId, `IP resolution done: ${withIp}/${subdomains.length} resolved`);
-  await saveResults(tenantId, jobId, subdomains);
+  await saveSubdomainResults(tenantId, jobId, subdomains);
 }
 
-async function saveResults(tenantId, jobId, subdomains) {
+async function runOpenPortsScan(domain, tenantId, jobId) {
+  log('scan', jobId, `▶ Starting open ports scan | rootDomain=${domain} tenantId=${tenantId}`);
+
+  await ScanJob.findOneAndUpdate(
+    { jobId },
+    { jobId, tenantId, domain, type: 'openPorts', status: 'running', startedAt: new Date() },
+    { upsert: true }
+  );
+  log('scan', jobId, 'ScanJob status → running');
+
+  // Load subdomains from CTEMData so we can scan each one
+  const ctemDoc = await CTEMData.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId) }).lean();
+  const storedSubs = (ctemDoc?.subdomains || []).filter(s => s.sub);
+
+  // Build deduplicated target list: root domain first, then all discovered subdomains
+  const seen = new Set([domain]);
+  const targets = [{ host: domain, ip: '' }];
+  for (const s of storedSubs) {
+    if (!seen.has(s.sub)) {
+      seen.add(s.sub);
+      targets.push({ host: s.sub, ip: s.ip || '' });
+    }
+  }
+  log('scan', jobId, `Target list: ${targets.length} host(s) — root domain + ${targets.length - 1} subdomains`);
+
+  // Scan in concurrent batches of 3
+  const CONCURRENCY = 3;
+  const results = [];
+  let totalPorts = 0;
+
+  for (let i = 0; i < targets.length; i += CONCURRENCY) {
+    const batch = targets.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map(async (target, bi) => {
+        const scanId = `${jobId}_${i + bi}`;
+        const ports = await runNmap(target.host, jobId, scanId);
+        return { ...target, ports };
+      })
+    );
+
+    for (const result of batchResults) {
+      if (result.ports.length > 0) {
+        results.push({ host: result.host, ip: result.ip, ports: result.ports });
+        totalPorts += result.ports.length;
+      }
+    }
+
+    // Progressive count update so frontend polling shows progress
+    await ScanJob.findOneAndUpdate({ jobId }, { count: totalPorts });
+    const done = Math.min(i + CONCURRENCY, targets.length);
+    log('scan', jobId, `Progress: ${done}/${targets.length} hosts | ${totalPorts} open ports so far`);
+  }
+
+  log('scan', jobId, `Writing ${results.length} host groups (${totalPorts} total ports) to CTEMData...`);
+  try {
+    await CTEMData.findOneAndUpdate(
+      { tenantId: new mongoose.Types.ObjectId(tenantId) },
+      { $set: { openPorts: results } },
+      { upsert: true, new: true }
+    );
+    log('scan', jobId, 'CTEMData updated ✓');
+  } catch (err) {
+    logErr('scan', jobId, `CTEMData write failed: ${err.message}`);
+    throw err;
+  }
+
+  await ScanJob.findOneAndUpdate(
+    { jobId },
+    { status: 'complete', count: totalPorts, completedAt: new Date() },
+    { upsert: true }
+  );
+  log('scan', jobId, `■ Scan complete — ${results.length} hosts with open ports, ${totalPorts} total ports saved`);
+}
+
+async function saveSubdomainResults(tenantId, jobId, subdomains) {
   log('scan', jobId, `Writing ${subdomains.length} subdomains to CTEMData...`);
   try {
     await CTEMData.findOneAndUpdate(
@@ -276,7 +419,8 @@ async function saveResults(tenantId, jobId, subdomains) {
 app.get('/health', (_, res) => {
   const subfinderOk = Boolean(SUBFINDER_BIN && fs.existsSync(SUBFINDER_BIN));
   const amassOk     = fs.existsSync(AMASS_BIN);
-  res.json({ status: 'ok', amass: AMASS_BIN, amassOk, subfinder: SUBFINDER_BIN || null, subfinderOk });
+  const nmapOk      = fs.existsSync(NMAP_BIN);
+  res.json({ status: 'ok', amassOk, subfinderOk, nmapOk, nmap: NMAP_BIN });
 });
 
 app.post('/scan/subdomains', async (req, res) => {
@@ -287,14 +431,37 @@ app.post('/scan/subdomains', async (req, res) => {
     return res.status(400).json({ error: 'domain, tenantId, jobId are required' });
   }
 
-  log('helper', jobId, `Accepted scan request for domain=${domain}`);
-
-  // Respond immediately — scan runs in background
+  log('helper', jobId, `Accepted subdomain scan request for domain=${domain}`);
   res.json({ accepted: true, jobId });
 
-  // Run scan async (errors are caught and written to ScanJob)
   runSubdomainScan(domain, tenantId, jobId).catch(async (err) => {
     logErr('scan', jobId, `Unhandled scan error: ${err.message}`);
+    if (err.stack) logErr('scan', jobId, err.stack.split('\n').slice(1, 4).join(' | '));
+    try {
+      await ScanJob.findOneAndUpdate(
+        { jobId },
+        { status: 'failed', error: err.message, completedAt: new Date() }
+      );
+      log('scan', jobId, 'ScanJob status → failed (written to DB)');
+    } catch (dbErr) {
+      logErr('scan', jobId, `Could not write failed status to DB: ${dbErr.message}`);
+    }
+  });
+});
+
+app.post('/scan/openports', async (req, res) => {
+  const { domain, tenantId, jobId } = req.body;
+
+  if (!domain || !tenantId || !jobId) {
+    logErr('helper', jobId || null, `Bad request — missing fields`);
+    return res.status(400).json({ error: 'domain, tenantId, jobId are required' });
+  }
+
+  log('helper', jobId, `Accepted open ports scan request for domain=${domain}`);
+  res.json({ accepted: true, jobId });
+
+  runOpenPortsScan(domain, tenantId, jobId).catch(async (err) => {
+    logErr('scan', jobId, `Unhandled open ports scan error: ${err.message}`);
     if (err.stack) logErr('scan', jobId, err.stack.split('\n').slice(1, 4).join(' | '));
     try {
       await ScanJob.findOneAndUpdate(
@@ -315,23 +482,26 @@ mongoose.connect(MONGODB_URI)
   .then(() => {
     log('startup', null, `MongoDB connected ✓ | ${MONGODB_URI}`);
 
-    // Check amass
     if (!fs.existsSync(AMASS_BIN)) {
       logErr('startup', null, `amass NOT found at ${AMASS_BIN}`);
-      logErr('startup', null, 'Install: apt install amass  OR set AMASS_BIN in .env');
     } else {
       log('startup', null, `amass found ✓ | ${AMASS_BIN}`);
     }
 
-    // Check subfinder
     if (!SUBFINDER_BIN) {
       log('startup', null, 'subfinder not configured (SUBFINDER_BIN not set) — will fall back to amass');
     } else if (!fs.existsSync(SUBFINDER_BIN)) {
       logErr('startup', null, `subfinder configured but NOT found at ${SUBFINDER_BIN}`);
-      logErr('startup', null, 'Install: go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest');
       log('startup', null, 'Falling back to amass for all scans');
     } else {
-      log('startup', null, `subfinder found ✓ | ${SUBFINDER_BIN} (will be used as primary tool)`);
+      log('startup', null, `subfinder found ✓ | ${SUBFINDER_BIN} (primary tool for subdomain scans)`);
+    }
+
+    if (!fs.existsSync(NMAP_BIN)) {
+      logErr('startup', null, `nmap NOT found at ${NMAP_BIN}`);
+      logErr('startup', null, 'Install: apt install nmap  OR set NMAP_BIN in .env');
+    } else {
+      log('startup', null, `nmap found ✓ | ${NMAP_BIN} (used for open ports scans)`);
     }
 
     app.listen(PORT, '0.0.0.0', () => {
