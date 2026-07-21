@@ -91,6 +91,18 @@ function cleanup(...files) {
   }
 }
 
+// Normalize a hostname for comparison (lowercase, strip trailing dots / leading www.)
+function normHost(h) {
+  return String(h || '').trim().toLowerCase().replace(/\.+$/, '').replace(/^www\./, '');
+}
+
+// Is `host` the root domain itself, or a subdomain of it?
+function belongsToDomain(host, domain) {
+  const h = normHost(host);
+  const d = normHost(domain);
+  return !!d && (h === d || h.endsWith('.' + d));
+}
+
 // Parse nmap normal-format text output (-oN) into structured port objects
 function parseNmapOutput(output) {
   const results = [];
@@ -276,7 +288,7 @@ async function runSubdomainScan(domain, tenantId, jobId) {
 
       cleanup(jsonFile, txtFile);
       log('scan', jobId, `Temp files cleaned: ${jsonFile}`);
-      await saveSubdomainResults(tenantId, jobId, subdomains);
+      await saveSubdomainResults(tenantId, jobId, domain, subdomains);
       return;
     }
 
@@ -308,7 +320,7 @@ async function runSubdomainScan(domain, tenantId, jobId) {
 
   const withIp = subdomains.filter(s => s.ip).length;
   log('scan', jobId, `IP resolution done: ${withIp}/${subdomains.length} resolved`);
-  await saveSubdomainResults(tenantId, jobId, subdomains);
+  await saveSubdomainResults(tenantId, jobId, domain, subdomains);
 }
 
 async function runOpenPortsScan(domain, tenantId, jobId) {
@@ -385,12 +397,50 @@ async function runOpenPortsScan(domain, tenantId, jobId) {
   log('scan', jobId, `■ Scan complete — ${results.length} hosts with open ports, ${totalPorts} total ports saved`);
 }
 
-async function saveSubdomainResults(tenantId, jobId, subdomains) {
-  log('scan', jobId, `Writing ${subdomains.length} subdomains to CTEMData...`);
+async function saveSubdomainResults(tenantId, jobId, domain, subdomains) {
+  const oid = new mongoose.Types.ObjectId(tenantId);
+  const root = normHost(domain);
+
+  // Stamp the owning root domain so results group per-domain (and so merges are
+  // precise). The backend also re-derives this on read, but stamping keeps the
+  // stored data correct.
+  const scanned = subdomains.map(s => ({ ...s, rootDomain: root }));
+
+  // MERGE, don't replace. A tenant can own several root domains, each scanned
+  // separately; `$set: { subdomains }` with only this domain's results wiped the
+  // others. Keep every OTHER domain's subdomains intact and swap in only the ones
+  // for the domain we just scanned. Preserve admin-managed fields (criticality,
+  // SSL/cert-expiry) for subdomains that still exist by name across a re-scan.
+  const existingDoc = await CTEMData.findOne({ tenantId: oid }).lean();
+  const existing = Array.isArray(existingDoc?.subdomains) ? existingDoc.subdomains : [];
+
+  const prevForDomain = new Map();
+  const kept = [];
+  for (const s of existing) {
+    if (s && belongsToDomain(s.sub, domain)) prevForDomain.set(normHost(s.sub), s);
+    else kept.push(s);
+  }
+
+  const mergedForDomain = scanned.map(s => {
+    const prev = prevForDomain.get(normHost(s.sub));
+    if (!prev) return s;
+    return {
+      ...s,
+      assetCriticality: prev.assetCriticality || s.assetCriticality,
+      sslGrade:         prev.sslGrade || s.sslGrade,
+      sslDaysRemaining: prev.sslDaysRemaining != null ? prev.sslDaysRemaining : s.sslDaysRemaining,
+      ...(prev.sslExpiresAt ? { sslExpiresAt: prev.sslExpiresAt } : {}),
+    };
+  });
+
+  const merged = kept.concat(mergedForDomain);
+  log('scan', jobId, `Merge for ${domain}: kept ${kept.length} from other domains + ${mergedForDomain.length} scanned = ${merged.length} total`);
+
+  log('scan', jobId, `Writing ${merged.length} subdomains to CTEMData...`);
   try {
     await CTEMData.findOneAndUpdate(
-      { tenantId: new mongoose.Types.ObjectId(tenantId) },
-      { $set: { subdomains } },
+      { tenantId: oid },
+      { $set: { subdomains: merged } },
       { upsert: true, new: true }
     );
     log('scan', jobId, `CTEMData updated ✓`);
@@ -403,16 +453,16 @@ async function saveSubdomainResults(tenantId, jobId, subdomains) {
   try {
     await ScanJob.findOneAndUpdate(
       { jobId },
-      { status: 'complete', count: subdomains.length, completedAt: new Date() },
+      { status: 'complete', count: scanned.length, completedAt: new Date() },
       { upsert: true }
     );
-    log('scan', jobId, `ScanJob status → complete (count=${subdomains.length}) ✓`);
+    log('scan', jobId, `ScanJob status → complete (count=${scanned.length}) ✓`);
   } catch (err) {
     logErr('scan', jobId, `ScanJob write failed: ${err.message}`);
     throw err;
   }
 
-  log('scan', jobId, `■ Scan complete — ${subdomains.length} subdomains saved to DB`);
+  log('scan', jobId, `■ Scan complete — ${scanned.length} subdomains for ${domain} saved (${merged.length} total across all domains)`);
 }
 
 // ─── routes ───────────────────────────────────────────────────────────────────
