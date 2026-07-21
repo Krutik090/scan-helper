@@ -325,6 +325,8 @@ async function runSubdomainScan(domain, tenantId, jobId) {
 
 async function runOpenPortsScan(domain, tenantId, jobId) {
   log('scan', jobId, `▶ Starting open ports scan | rootDomain=${domain} tenantId=${tenantId}`);
+  const oid = new mongoose.Types.ObjectId(tenantId);
+  const root = normHost(domain);
 
   await ScanJob.findOneAndUpdate(
     { jobId },
@@ -333,20 +335,18 @@ async function runOpenPortsScan(domain, tenantId, jobId) {
   );
   log('scan', jobId, 'ScanJob status → running');
 
-  // Load subdomains from CTEMData so we can scan each one
-  const ctemDoc = await CTEMData.findOne({ tenantId: new mongoose.Types.ObjectId(tenantId) }).lean();
-  const storedSubs = (ctemDoc?.subdomains || []).filter(s => s.sub);
+  // Scope to THIS root domain: scan the root domain + only ITS subdomains, so
+  // port-scanning bbb.com neither scans nor overwrites aaa.com's hosts.
+  const ctemDoc = await CTEMData.findOne({ tenantId: oid }).lean();
+  const domainSubs = (ctemDoc?.subdomains || []).filter(s => s && s.sub && belongsToDomain(s.sub, domain));
 
-  // Build deduplicated target list: root domain first, then all discovered subdomains
-  const seen = new Set([domain]);
+  const seen = new Set([root]);
   const targets = [{ host: domain, ip: '' }];
-  for (const s of storedSubs) {
-    if (!seen.has(s.sub)) {
-      seen.add(s.sub);
-      targets.push({ host: s.sub, ip: s.ip || '' });
-    }
+  for (const s of domainSubs) {
+    const h = normHost(s.sub);
+    if (!seen.has(h)) { seen.add(h); targets.push({ host: s.sub, ip: s.ip || '' }); }
   }
-  log('scan', jobId, `Target list: ${targets.length} host(s) — root domain + ${targets.length - 1} subdomains`);
+  log('scan', jobId, `Target list for ${domain}: ${targets.length} host(s) — root + ${targets.length - 1} subdomain(s)`);
 
   // Scan in concurrent batches of 3
   const CONCURRENCY = 3;
@@ -365,7 +365,8 @@ async function runOpenPortsScan(domain, tenantId, jobId) {
 
     for (const result of batchResults) {
       if (result.ports.length > 0) {
-        results.push({ host: result.host, ip: result.ip, ports: result.ports });
+        // Stamp the owning root domain so results group per-domain on read.
+        results.push({ host: result.host, ip: result.ip, ports: result.ports, rootDomain: root });
         totalPorts += result.ports.length;
       }
     }
@@ -376,11 +377,18 @@ async function runOpenPortsScan(domain, tenantId, jobId) {
     log('scan', jobId, `Progress: ${done}/${targets.length} hosts | ${totalPorts} open ports so far`);
   }
 
-  log('scan', jobId, `Writing ${results.length} host groups (${totalPorts} total ports) to CTEMData...`);
+  // MERGE, don't replace: keep every OTHER root domain's host groups and swap in
+  // only this domain's — otherwise scanning one domain wiped the others' ports.
+  const existing = Array.isArray(ctemDoc?.openPorts) ? ctemDoc.openPorts : [];
+  const kept = existing.filter(hg => hg && hg.host && !belongsToDomain(hg.host, domain));
+  const merged = kept.concat(results);
+  log('scan', jobId, `Merge for ${domain}: kept ${kept.length} host group(s) from other domains + ${results.length} scanned = ${merged.length} total`);
+
+  log('scan', jobId, `Writing ${merged.length} host groups (${totalPorts} ports for ${domain}) to CTEMData...`);
   try {
     await CTEMData.findOneAndUpdate(
-      { tenantId: new mongoose.Types.ObjectId(tenantId) },
-      { $set: { openPorts: results } },
+      { tenantId: oid },
+      { $set: { openPorts: merged } },
       { upsert: true, new: true }
     );
     log('scan', jobId, 'CTEMData updated ✓');
@@ -394,7 +402,7 @@ async function runOpenPortsScan(domain, tenantId, jobId) {
     { status: 'complete', count: totalPorts, completedAt: new Date() },
     { upsert: true }
   );
-  log('scan', jobId, `■ Scan complete — ${results.length} hosts with open ports, ${totalPorts} total ports saved`);
+  log('scan', jobId, `■ Scan complete for ${domain} — ${results.length} hosts, ${totalPorts} ports (${merged.length} host groups total across all domains)`);
 }
 
 async function saveSubdomainResults(tenantId, jobId, domain, subdomains) {
