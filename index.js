@@ -125,7 +125,9 @@ function parseNmapOutput(output) {
       service,
       version:  (version || '').trim(),
       state:    'Open',
-      risk:     'Unknown',
+      // Newly-scanned ports start at Low; analysts raise the risk based on asset
+      // criticality (was 'Unknown', which is no longer a valid risk value).
+      risk:     'Low',
     });
   }
   return results;
@@ -438,6 +440,11 @@ async function saveSubdomainResults(tenantId, jobId, domain, subdomains) {
       sslGrade:         prev.sslGrade || s.sslGrade,
       sslDaysRemaining: prev.sslDaysRemaining != null ? prev.sslDaysRemaining : s.sslDaysRemaining,
       ...(prev.sslExpiresAt ? { sslExpiresAt: prev.sslExpiresAt } : {}),
+      // Preserve client/admin-managed asset owner across re-scans (scanned rows
+      // don't carry it) — otherwise onboarding's "every asset has an owner"
+      // prerequisite regresses on the next scan.
+      ...(prev.ownerName ? { ownerName: prev.ownerName } : {}),
+      ...(prev.ownerEmail ? { ownerEmail: prev.ownerEmail } : {}),
     };
   });
 
