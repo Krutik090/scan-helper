@@ -96,6 +96,12 @@ function normHost(h) {
   return String(h || '').trim().toLowerCase().replace(/\.+$/, '').replace(/^www\./, '');
 }
 
+// Exact entry identity: lowercase, trailing dot stripped, `www.` KEPT —
+// `www.acme.test` and `acme.test` are two different entries.
+function hostKey(h) {
+  return String(h || '').trim().toLowerCase().replace(/\.+$/, '');
+}
+
 // Is `host` the root domain itself, or a subdomain of it?
 function belongsToDomain(host, domain) {
   const h = normHost(host);
@@ -407,49 +413,70 @@ async function runOpenPortsScan(domain, tenantId, jobId) {
   log('scan', jobId, `■ Scan complete for ${domain} — ${results.length} hosts, ${totalPorts} ports (${merged.length} host groups total across all domains)`);
 }
 
-async function saveSubdomainResults(tenantId, jobId, domain, subdomains) {
-  const oid = new mongoose.Types.ObjectId(tenantId);
+// Fields the platform (admin / client / per-entry Check) owns on a subdomain
+// entry. A rescan refreshes discovery data (ip, status) and must not touch these.
+const ADMIN_OWNED = [
+  '_id', 'assetCriticality', 'ownerName', 'ownerEmail',
+  'sslGrade', 'sslDaysRemaining', 'sslExpiresAt',
+  'source', 'addedAt', 'addedBy', 'lastCheckedAt', 'checkError',
+];
+
+// UPSERT the scan results for one root domain into the tenant's subdomain list.
+//   · entries of OTHER root domains (and Unassigned ones) are untouched;
+//   · an existing entry the scan found again gets fresh ip/status, keeps ADMIN_OWNED;
+//   · an existing entry the scan did NOT find is kept as-is (hand-added or
+//     client-requested subdomains must survive a rescan; so does anything the
+//     scanner just missed this time);
+//   · a new entry is created with source 'scan'.
+// Pure: no I/O. Exported for tests.
+function mergeSubdomainResults(existing, scanned, domain) {
   const root = normHost(domain);
-
-  // Stamp the owning root domain so results group per-domain (and so merges are
-  // precise). The backend also re-derives this on read, but stamping keeps the
-  // stored data correct.
-  const scanned = subdomains.map(s => ({ ...s, rootDomain: root }));
-
-  // MERGE, don't replace. A tenant can own several root domains, each scanned
-  // separately; `$set: { subdomains }` with only this domain's results wiped the
-  // others. Keep every OTHER domain's subdomains intact and swap in only the ones
-  // for the domain we just scanned. Preserve admin-managed fields (criticality,
-  // SSL/cert-expiry) for subdomains that still exist by name across a re-scan.
-  const existingDoc = await CTEMData.findOne({ tenantId: oid }).lean();
-  const existing = Array.isArray(existingDoc?.subdomains) ? existingDoc.subdomains : [];
-
-  const prevForDomain = new Map();
+  const now = new Date();
   const kept = [];
-  for (const s of existing) {
-    if (s && belongsToDomain(s.sub, domain)) prevForDomain.set(normHost(s.sub), s);
+  const prevForDomain = new Map();   // hostKey → existing entry for this root domain
+  for (const s of Array.isArray(existing) ? existing : []) {
+    if (!s || !s.sub) continue;
+    if (belongsToDomain(s.sub, domain)) prevForDomain.set(hostKey(s.sub), s);
     else kept.push(s);
   }
 
-  const mergedForDomain = scanned.map(s => {
-    const prev = prevForDomain.get(normHost(s.sub));
-    if (!prev) return s;
-    return {
-      ...s,
-      assetCriticality: prev.assetCriticality || s.assetCriticality,
-      sslGrade:         prev.sslGrade || s.sslGrade,
-      sslDaysRemaining: prev.sslDaysRemaining != null ? prev.sslDaysRemaining : s.sslDaysRemaining,
-      ...(prev.sslExpiresAt ? { sslExpiresAt: prev.sslExpiresAt } : {}),
-      // Preserve client/admin-managed asset owner across re-scans (scanned rows
-      // don't carry it) — otherwise onboarding's "every asset has an owner"
-      // prerequisite regresses on the next scan.
-      ...(prev.ownerName ? { ownerName: prev.ownerName } : {}),
-      ...(prev.ownerEmail ? { ownerEmail: prev.ownerEmail } : {}),
-    };
-  });
+  const out = [];
+  const seen = new Set();
+  let updated = 0, created = 0;
+  for (const raw of scanned) {
+    if (!raw || !raw.sub) continue;
+    const key = hostKey(raw.sub);
+    if (seen.has(key)) continue;         // scanners can repeat a name
+    seen.add(key);
+    const ip = raw.ip || '';
+    const fresh = { ...raw, sub: key, ip, status: ip ? 'Active' : 'Inactive', rootDomain: root };
+    const prev = prevForDomain.get(key);
+    if (!prev) {
+      out.push({ ...fresh, source: 'scan', addedAt: now });
+      created += 1;
+      continue;
+    }
+    prevForDomain.delete(key);
+    const merged = { ...fresh };
+    for (const f of ADMIN_OWNED) {
+      if (prev[f] !== undefined && prev[f] !== null && prev[f] !== '') merged[f] = prev[f];
+    }
+    if (!merged.source) merged.source = 'scan';
+    out.push(merged);
+    updated += 1;
+  }
+  // Whatever the scan did not return this time stays.
+  const retained = [...prevForDomain.values()];
+  return { merged: kept.concat(out, retained), kept: kept.length, updated, created, retained: retained.length };
+}
 
-  const merged = kept.concat(mergedForDomain);
-  log('scan', jobId, `Merge for ${domain}: kept ${kept.length} from other domains + ${mergedForDomain.length} scanned = ${merged.length} total`);
+async function saveSubdomainResults(tenantId, jobId, domain, subdomains) {
+  const oid = new mongoose.Types.ObjectId(tenantId);
+
+  const existingDoc = await CTEMData.findOne({ tenantId: oid }).lean();
+  const { merged, kept, updated, created, retained } = mergeSubdomainResults(existingDoc?.subdomains, subdomains, domain);
+  const scanned = subdomains;
+  log('scan', jobId, `Upsert for ${domain}: ${updated} updated, ${created} created, ${retained} retained (not found this run), ${kept} from other domains = ${merged.length} total`);
 
   log('scan', jobId, `Writing ${merged.length} subdomains to CTEMData...`);
   try {
@@ -539,6 +566,9 @@ app.post('/scan/openports', async (req, res) => {
     }
   });
 });
+
+module.exports = { mergeSubdomainResults, saveSubdomainResults, hostKey, normHost, belongsToDomain };
+if (require.main !== module) return;
 
 // ─── startup ─────────────────────────────────────────────────────────────────
 log('startup', null, `scan-helper initializing | port=${PORT} mongodb=${MONGODB_URI}`);
