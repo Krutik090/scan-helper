@@ -60,10 +60,21 @@ func Merge(existing, fresh []Subdomain, domain string, now time.Time) MergeResul
 	prev := make(map[string]Subdomain, len(existing))
 	for _, s := range existing {
 		if s.Sub == "" {
+			// A stored row with no identity cannot be matched against a scan result,
+			// but must not be deleted by a merge — pass it through unchanged.
+			kept = append(kept, s)
 			continue
 		}
 		if belongsToDomain(s.Sub, domain) {
-			prev[hostKey(s.Sub)] = s
+			key := hostKey(s.Sub)
+			if _, alreadyPresent := prev[key]; alreadyPresent {
+				// Pre-existing duplicate rows are upstream corruption; de-duplicating them
+				// is not this function's job, but losing one silently is unacceptable.
+				// First write wins the prev slot; the duplicate survives untouched in kept.
+				kept = append(kept, s)
+			} else {
+				prev[key] = s
+			}
 		} else {
 			kept = append(kept, s)
 		}

@@ -93,3 +93,64 @@ func TestMerge_FirstScanOnEmptyTenant(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+func TestMerge_DuplicateStoredEntriesAreNotLost(t *testing.T) {
+	// Two entries whose Sub values differ only in case or trailing dot,
+	// so they normalize to the same hostKey.
+	existing := []Subdomain{
+		{Sub: "api.acme.test", IP: "10.0.0.1", Source: "scan"},
+		{Sub: "API.acme.test.", IP: "10.0.0.2", Source: "client-request"},
+	}
+	// Fresh scan returns something else entirely.
+	fresh := []Subdomain{
+		{Sub: "web.acme.test", IP: "10.1.1.1"},
+	}
+
+	got := Merge(existing, fresh, "acme.test", time.Now())
+
+	// Both stored rows should still be present in Merged.
+	count := 0
+	var clientRequestEntry *Subdomain
+	for i, s := range got.Merged {
+		if hostKey(s.Sub) == "api.acme.test" {
+			count++
+			if s.Source == "client-request" {
+				clientRequestEntry = &got.Merged[i]
+			}
+		}
+	}
+
+	if count != 2 {
+		t.Errorf("expected 2 entries with hostKey 'api.acme.test', found %d", count)
+	}
+	if clientRequestEntry == nil {
+		t.Error("the entry with Source: client-request was not preserved")
+	}
+}
+
+func TestMerge_StoredEntryWithNoSubSurvives(t *testing.T) {
+	// One normal entry plus one entry with empty Sub.
+	existing := []Subdomain{
+		{Sub: "normal.acme.test", IP: "10.0.0.1", Source: "scan"},
+		{Sub: "", OwnerEmail: "orphan@acme.test"},
+	}
+	// Any fresh input.
+	fresh := []Subdomain{
+		{Sub: "other.acme.test", IP: "10.2.2.2"},
+	}
+
+	got := Merge(existing, fresh, "acme.test", time.Now())
+
+	// Find the empty-Sub row by its marker field.
+	var foundOrphan bool
+	for _, s := range got.Merged {
+		if s.OwnerEmail == "orphan@acme.test" {
+			foundOrphan = true
+			break
+		}
+	}
+
+	if !foundOrphan {
+		t.Error("the entry with empty Sub was not preserved in Merged")
+	}
+}
