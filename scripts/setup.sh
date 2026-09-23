@@ -115,7 +115,11 @@ subdomains:subfinder
 ports:nmap"
 
 TOOLS_MANIFEST=""
-if [[ -x ./scan-helper ]] && TOOLS_MANIFEST="$(./scan-helper -print-tools 2>/dev/null)"; then
+# The [[ -n ]] check matters: -print-tools could in principle exit 0 with
+# empty output (e.g. a registry with no modules), and without it the
+# fallback would never trigger — REQUIRED_TOOLS would silently end up
+# empty and the script would proceed having verified nothing.
+if [[ -x ./scan-helper ]] && TOOLS_MANIFEST="$(./scan-helper -print-tools 2>/dev/null)" && [[ -n "$TOOLS_MANIFEST" ]]; then
   ok "Read the required-tool list from ./scan-helper -print-tools"
 else
   warn "Could not read the tool list from the binary — using the hardcoded fallback list"
@@ -135,19 +139,45 @@ if [[ "$ENABLE_PORTSCAN" == "true" ]]; then
 fi
 
 install_subfinder() {
-  local arch tarball
+  local arch tarball checksums expected actual
   case "$(uname -m)" in
     x86_64)  arch="amd64" ;;
     aarch64) arch="arm64" ;;
     *) die "Unsupported architecture for subfinder: $(uname -m)" ;;
   esac
   tarball="subfinder_${SUBFINDER_VERSION}_linux_${arch}.zip"
+  checksums="subfinder_${SUBFINDER_VERSION}_checksums.txt"
   info "Installing subfinder ${SUBFINDER_VERSION}"
   curl -fsSL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/${tarball}" -o "/tmp/${tarball}"
+
+  # A security tool fetched over the network and dropped into
+  # /usr/local/bin must be verified before it's installed — an HTTP 200
+  # and a successful unzip are not proof the bytes are what
+  # projectdiscovery actually published. Verify against the checksums
+  # file published alongside the same release; refuse to install, with
+  # no fallback to installing unverified, if either step fails.
+  if ! curl -fsSL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/${checksums}" -o "/tmp/${checksums}"; then
+    rm -f "/tmp/${tarball}"
+    die "Could not download ${checksums} to verify the subfinder download — refusing to install an unverified binary."
+  fi
+
+  expected="$(awk -v f="$tarball" '$2==f{print $1}' "/tmp/${checksums}")"
+  if [[ -z "$expected" ]]; then
+    rm -f "/tmp/${tarball}" "/tmp/${checksums}"
+    die "No checksum entry for ${tarball} in ${checksums} — refusing to install an unverified binary."
+  fi
+
+  actual="$(sha256sum "/tmp/${tarball}" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    rm -f "/tmp/${tarball}" "/tmp/${checksums}"
+    die "subfinder checksum mismatch: expected ${expected}, got ${actual} — refusing to install."
+  fi
+  ok "subfinder checksum verified (sha256 ${actual})"
+
   $SUDO apt-get install -y unzip >/dev/null
   unzip -oq "/tmp/${tarball}" -d /tmp/subfinder-install
   $SUDO install -m 0755 /tmp/subfinder-install/subfinder /usr/local/bin/subfinder
-  rm -rf "/tmp/${tarball}" /tmp/subfinder-install
+  rm -rf "/tmp/${tarball}" "/tmp/${checksums}" /tmp/subfinder-install
 }
 
 install_tool() {
@@ -231,12 +261,41 @@ YAML
   chmod 600 config.yaml
 }
 
-if [[ -f config.yaml && "${ASSUME_YES:-0}" != "1" ]]; then
+# yaml_value: pull a quoted scalar out of the existing config.yaml by key,
+# e.g. `api_key: "..."` or `uri: "..."`. Never fails the script even when
+# the key is absent (set -e would otherwise abort on grep's no-match exit
+# status) — callers just get an empty string.
+yaml_value() {
+  grep -m1 -E "^[[:space:]]*${2}:" "$1" 2>/dev/null | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true
+}
+
+EXISTING_API_KEY=""
+EXISTING_MONGO_URI=""
+CONFIG_EXISTED=0
+if [[ -f config.yaml ]]; then
+  CONFIG_EXISTED=1
+  EXISTING_API_KEY="$(yaml_value config.yaml api_key)"
+  EXISTING_MONGO_URI="$(yaml_value config.yaml uri)"
+fi
+
+if [[ "$CONFIG_EXISTED" -eq 1 && "${ASSUME_YES:-0}" != "1" ]]; then
   read -rp "config.yaml already exists. Overwrite it? [y/N] " answer
   if [[ "${answer,,}" != "y" ]]; then
-    info "Keeping the existing config.yaml"
+    # The module selection made earlier in *this* run (possibly
+    # different from what's on disk) is being discarded along with
+    # everything else — say so, so it's never a silent surprise later.
+    info "Keeping the existing config.yaml — it was left untouched and may not reflect the module selections made in this run. Edit ./config.yaml directly if you want changes."
     SKIP_CONFIG=1
   fi
+elif [[ "$CONFIG_EXISTED" -eq 1 && "${ASSUME_YES:-0}" == "1" ]]; then
+  # ASSUME_YES=1 legitimately means "don't prompt me" — overwriting
+  # without asking is fine. Minting a fresh, unannounced API key is not:
+  # every existing caller is authenticated with the old one and would
+  # start getting silent 401s. So the existing key (and Mongo URI) are
+  # carried forward below unless this run's caller explicitly overrode
+  # them via API_KEY / MONGO_URI — and either way, this is not silent.
+  warn "config.yaml already exists — overwriting it because ASSUME_YES=1 (no prompt)."
+  info "The existing API key and Mongo URI are preserved unless API_KEY / MONGO_URI were set for this run."
 fi
 
 if [[ "${SKIP_CONFIG:-0}" != "1" ]]; then
@@ -252,13 +311,19 @@ if [[ "${SKIP_CONFIG:-0}" != "1" ]]; then
     esac
   fi
 
-  MONGO_URI="${MONGO_URI:-mongodb://localhost:27017/ThreatIntel}"
+  # An override always wins; otherwise reuse what was already configured
+  # rather than silently resetting it back to the default.
+  MONGO_URI="${MONGO_URI:-${EXISTING_MONGO_URI:-mongodb://localhost:27017/ThreatIntel}}"
   if [[ "$MODE" == "mongo" && "${ASSUME_YES:-0}" != "1" ]]; then
     read -rp "  MongoDB URI [${MONGO_URI}]: " answer
     [[ -n "$answer" ]] && MONGO_URI="$answer"
   fi
 
-  API_KEY="${API_KEY:-}"
+  # Same rule for the API key: an explicit override wins; otherwise reuse
+  # the existing key so a re-run never silently invalidates every caller
+  # already authenticated with it. Only generate a fresh one when there
+  # is genuinely no existing key to preserve.
+  API_KEY="${API_KEY:-$EXISTING_API_KEY}"
   if [[ -z "$API_KEY" ]]; then
     if [[ "${ASSUME_YES:-0}" != "1" ]]; then
       read -rp "  API key (blank to generate one): " API_KEY
