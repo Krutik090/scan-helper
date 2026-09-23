@@ -192,6 +192,37 @@ func TestJobs_UnknownIDIs404(t *testing.T) {
 	}
 }
 
+type panicModule struct{ name string }
+
+func (p panicModule) Name() string { return p.name }
+func (p panicModule) RequiredTools() []modules.ToolRequirement {
+	return []modules.ToolRequirement{{Name: "sh", BinPath: "sh"}}
+}
+func (p panicModule) Run(context.Context, modules.RunParams, func(int)) (any, error) {
+	panic("boom: nil pointer somewhere in the module")
+}
+
+func TestScan_PanickingModuleDoesNotCrashTheServer(t *testing.T) {
+	srv := testServer(t, config.ModeAPIResponse, panicModule{name: "subdomains"})
+
+	rec := post(t, srv, "/api/v1/scans/subdomains", "test-key", ScanRequest{Domain: "acme.test", TenantID: "t1"})
+	var accepted ScanAccepted
+	_ = json.Unmarshal(rec.Body.Bytes(), &accepted)
+
+	job := waitForTerminal(t, srv, accepted.JobID)
+	if job.Status != string(jobs.StatusFailed) || job.Error == "" {
+		t.Fatalf("job = %+v", job)
+	}
+
+	// The server must keep serving after a module panic.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	healthRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(healthRec, req)
+	if healthRec.Code != http.StatusOK {
+		t.Fatalf("health after panic = %d, want 200", healthRec.Code)
+	}
+}
+
 type jobView struct {
 	JobID  string `json:"jobId"`
 	Status string `json:"status"`

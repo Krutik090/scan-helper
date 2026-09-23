@@ -55,6 +55,35 @@ func TestStore_ListFilters(t *testing.T) {
 	}
 }
 
+func TestStore_CreateIfAbsentIsAtomic(t *testing.T) {
+	s := NewStore()
+
+	const attempts = 50
+	var wg sync.WaitGroup
+	results := make([]bool, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			results[n] = s.CreateIfAbsent(&Job{ID: "dup", Status: StatusRunning})
+		}(i)
+	}
+	wg.Wait()
+
+	created := 0
+	for _, ok := range results {
+		if ok {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("CreateIfAbsent reported true %d times, want exactly 1", created)
+	}
+	if _, ok := s.Snapshot("dup"); !ok {
+		t.Fatal("job should exist after concurrent CreateIfAbsent calls")
+	}
+}
+
 func TestStore_ConcurrentWritesAreSafe(t *testing.T) {
 	s := NewStore()
 	s.Create(&Job{ID: "hot", Status: StatusRunning})

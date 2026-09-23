@@ -59,13 +59,6 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		jobID = fmt.Sprintf("%s-%d", moduleName, time.Now().UnixNano())
 	}
 
-	// An already-known job id is idempotent: return the existing job
-	// rather than starting a second scan over the same ground.
-	if _, exists := s.deps.Jobs.Get(jobID); exists {
-		writeJSON(w, http.StatusAccepted, ScanAccepted{JobID: jobID})
-		return
-	}
-
 	job := &jobs.Job{
 		ID:       jobID,
 		Module:   moduleName,
@@ -73,7 +66,16 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		Domain:   req.Domain,
 		Status:   jobs.StatusRunning,
 	}
-	s.deps.Jobs.Create(job)
+
+	// CreateIfAbsent is atomic: an already-known job id is idempotent —
+	// return the existing job rather than starting a second scan over
+	// the same ground. A separate exists-check then Create would leave a
+	// window where two concurrent posts of the same id both pass the
+	// check and both start a scan.
+	if !s.deps.Jobs.CreateIfAbsent(job) {
+		writeJSON(w, http.StatusAccepted, ScanAccepted{JobID: jobID})
+		return
+	}
 
 	go s.runJob(module, jobID, modules.RunParams{JobID: jobID, TenantID: req.TenantID, Domain: req.Domain})
 
@@ -82,10 +84,21 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 
 // runJob executes a module and records the outcome. It runs on its own
 // goroutine with a background context, so a client disconnecting does
-// not abort a scan already under way.
+// not abort a scan already under way. A panicking module must not take
+// the whole process — and every other in-flight job — down with it, so
+// a recover here converts it into a failed job instead.
 func (s *Server) runJob(module modules.Module, jobID string, params modules.RunParams) {
 	logger := s.deps.Logger.With("job", jobID, "module", module.Name(), "domain", params.Domain)
 	logger.Info("scan started")
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("scan panicked", "panic", rec)
+			s.deps.Jobs.SetError(jobID, fmt.Errorf("module panicked: %v", rec))
+			s.deps.Jobs.SetStatus(jobID, jobs.StatusFailed)
+			s.persist(jobID, logger)
+		}
+	}()
 
 	result, err := module.Run(context.Background(), params, func(count int) {
 		s.deps.Jobs.SetCount(jobID, count)

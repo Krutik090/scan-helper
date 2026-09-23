@@ -54,6 +54,25 @@ func (s *Store) Create(job *Job) {
 	s.jobs[job.ID] = job
 }
 
+// CreateIfAbsent stores job under a single write lock and returns true,
+// unless a job with the same id already exists, in which case it makes
+// no change and returns false. This closes the TOCTOU gap that a
+// separate Get-then-Create would leave open: two concurrent POSTs with
+// the same client-supplied job id (the retry scenario the API layer
+// exists to be idempotent for) must result in exactly one job.
+func (s *Store) CreateIfAbsent(job *Job) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.jobs[job.ID]; exists {
+		return false
+	}
+	if job.StartedAt.IsZero() {
+		job.StartedAt = time.Now()
+	}
+	s.jobs[job.ID] = job
+	return true
+}
+
 // Get returns a live pointer to the job without copying. Safe only for
 // existence checks (e.g., if _, exists := s.Get(id); exists {...}).
 // Do NOT read fields off the returned pointer — concurrent SetCount, SetStatus,
