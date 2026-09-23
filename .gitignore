@@ -1,2 +1,3 @@
 /scan-helper
 config.yaml
+*.test
