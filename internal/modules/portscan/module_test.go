@@ -2,6 +2,7 @@ package portscan
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -63,11 +64,17 @@ func TestScanTargets_BoundedConcurrencyAndProgress(t *testing.T) {
 	}
 
 	var progressCalls int32
-	groups := scanTargets(context.Background(), targets, "acme.test", workers, scan,
+	groups, err := scanTargets(context.Background(), targets, "acme.test", workers, scan,
 		func(int) { atomic.AddInt32(&progressCalls, 1) })
+	if err != nil {
+		t.Fatalf("scanTargets returned an unexpected error: %v", err)
+	}
 
 	if peak > workers {
 		t.Fatalf("peak concurrency %d exceeded the %d-worker bound", peak, workers)
+	}
+	if peak < 2 {
+		t.Fatalf("peak concurrency %d never rose above 1 — a fully sequential implementation would also pass otherwise", peak)
 	}
 	if len(groups) != 5 {
 		t.Fatalf("got %d host groups, want 5 (the host with no open ports is omitted): %+v", len(groups), groups)
@@ -82,6 +89,54 @@ func TestScanTargets_BoundedConcurrencyAndProgress(t *testing.T) {
 	}
 	if progressCalls == 0 {
 		t.Error("progress should be reported as hosts complete")
+	}
+}
+
+func TestScanTargets_AllTargetsFailingIsAnError(t *testing.T) {
+	scan := func(_ context.Context, target string) ([]Port, string, error) {
+		return nil, "", fmt.Errorf("connection refused to %s", target)
+	}
+
+	targets := []Target{
+		{Host: "a.acme.test"}, {Host: "b.acme.test"}, {Host: "c.acme.test"},
+	}
+
+	groups, err := scanTargets(context.Background(), targets, "acme.test", 3, scan, nil)
+	if err == nil {
+		t.Fatal("expected an error when every target failed, got nil")
+	}
+	if !strings.Contains(err.Error(), "acme.test") {
+		t.Errorf("error should name the domain, got %v", err)
+	}
+	if len(groups) != 0 {
+		t.Errorf("got %d host groups, want none when every target failed: %+v", len(groups), groups)
+	}
+}
+
+func TestScanTargets_PartialFailureStillSucceeds(t *testing.T) {
+	scan := func(_ context.Context, target string) ([]Port, string, error) {
+		if strings.HasPrefix(target, "bad") {
+			return nil, "", fmt.Errorf("connection refused to %s", target)
+		}
+		return []Port{{Port: 443, Protocol: "tcp", State: "Open"}}, "9.9.9.9", nil
+	}
+
+	targets := []Target{
+		{Host: "bad1.acme.test"}, {Host: "good1.acme.test"},
+		{Host: "bad2.acme.test"}, {Host: "good2.acme.test"},
+	}
+
+	groups, err := scanTargets(context.Background(), targets, "acme.test", 2, scan, nil)
+	if err != nil {
+		t.Fatalf("partial failure should still succeed, got error: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("got %d host groups, want exactly the 2 successful hosts: %+v", len(groups), groups)
+	}
+	for _, g := range groups {
+		if strings.HasPrefix(g.Host, "bad") {
+			t.Errorf("a failed host produced a group: %+v", g)
+		}
 	}
 }
 

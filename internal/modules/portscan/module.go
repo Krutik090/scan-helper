@@ -111,7 +111,10 @@ func (m *Module) Run(ctx context.Context, params modules.RunParams, onProgress f
 		return runNmap(ctx, m.cfg.NmapBin, target, perHostTimeout)
 	}
 
-	groups := scanTargets(ctx, targets, params.Domain, m.cfg.WorkerPool, scan, onProgress)
+	groups, err := scanTargets(ctx, targets, params.Domain, m.cfg.WorkerPool, scan, onProgress)
+	if err != nil {
+		return nil, err
+	}
 	return Result{Domain: params.Domain, HostGroups: groups}, nil
 }
 
@@ -123,7 +126,16 @@ func (m *Module) Run(ctx context.Context, params modules.RunParams, onProgress f
 // jumps of one batch.
 //
 // A host with no open ports produces no group: it genuinely has nothing
-// open, and an empty group would only add noise.
+// open, and an empty group would only add noise. A host that errors is
+// likewise skipped from the results, but its failure is counted: if
+// every target errored, that is not "nothing open" but a total scan
+// failure (a crashing nmap binary, missing permissions, and so on), and
+// is reported as an error rather than as an empty success — the storage
+// layer's Merge REPLACES a domain's host groups with whatever this
+// returns, so an empty success here would silently delete every
+// previously-known open port for the domain. Partial failure — some
+// hosts unreachable, others fine — is normal for a real scan and stays
+// a success with whatever data came back.
 func scanTargets(
 	ctx context.Context,
 	targets []Target,
@@ -131,7 +143,7 @@ func scanTargets(
 	workers int,
 	scan scanFunc,
 	onProgress func(int),
-) []HostGroup {
+) ([]HostGroup, error) {
 	if workers < 1 {
 		workers = 1
 	}
@@ -141,13 +153,24 @@ func scanTargets(
 	out := make(chan HostGroup, len(targets))
 
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failCount int
+	var lastErr error
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for t := range in {
 				ports, ip, err := scan(ctx, t.Host)
-				if err != nil || len(ports) == 0 {
+				if err != nil {
+					mu.Lock()
+					failCount++
+					lastErr = err
+					mu.Unlock()
+					continue
+				}
+				if len(ports) == 0 {
 					continue
 				}
 				if ip == "" {
@@ -183,7 +206,11 @@ func scanTargets(
 			onProgress(total)
 		}
 	}
-	return groups
+
+	if len(targets) > 0 && failCount == len(targets) {
+		return nil, fmt.Errorf("all %d targets failed scanning %s: %w", failCount, domain, lastErr)
+	}
+	return groups, nil
 }
 
 func fileExists(path string) bool {
