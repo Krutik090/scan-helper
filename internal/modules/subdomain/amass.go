@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,6 +69,27 @@ func runAmass(ctx context.Context, bin, domain string, timeoutMinutes int, workD
 	return nil, nil, nil
 }
 
+// readErr decides what a scanner failure means for an amass output file.
+//
+// These two read a FILE, not a pipe, so unlike the subfinder reader they
+// can never hang a running process by abandoning it — the deferred Close
+// is all the cleanup there is. What they shared was the other half of
+// the problem: returning the error failed the ENTIRE scan over one
+// over-long line (bufio.ErrTooLong), discarding every name already
+// parsed. A line that long is not a subdomain, so log it, keep what was
+// read, and only surface the failure when there is nothing to keep.
+func readErr(err error, path string, read int) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, bufio.ErrTooLong) || read == 0 {
+		return err
+	}
+	slog.Warn("an amass output line exceeded the read limit; that line was skipped",
+		"file", path, "entries_read", read)
+	return nil
+}
+
 // parseAmassJSON reads amass's JSON output: one object per line, NOT a
 // JSON array. A line that doesn't parse is skipped rather than failing
 // the whole scan. A missing file is not an error — amass may not have
@@ -102,7 +125,7 @@ func parseAmassJSON(path string) ([]Subdomain, error) {
 		}
 		out = append(out, Subdomain{Sub: rec.Name, IP: ip})
 	}
-	return out, scanner.Err()
+	return out, readErr(scanner.Err(), path, len(out))
 }
 
 // parseAmassTxt reads the plain one-name-per-line output.
@@ -124,5 +147,5 @@ func parseAmassTxt(path string) ([]string, error) {
 			names = append(names, line)
 		}
 	}
-	return names, scanner.Err()
+	return names, readErr(scanner.Err(), path, len(names))
 }

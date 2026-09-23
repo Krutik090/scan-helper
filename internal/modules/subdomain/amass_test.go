@@ -110,3 +110,47 @@ func TestRunAmass_SuccessWithNoOutputIsNotAnError(t *testing.T) {
 		t.Fatalf("expected no records and no names, got %v / %v", records, names)
 	}
 }
+
+// An over-long line in an amass output file cannot hang anything — these
+// read a file, not a live pipe — but returning the error failed the
+// whole scan and threw away every name already parsed. Keep what was
+// read instead.
+func TestParseAmass_OverLongLineKeepsWhatWasRead(t *testing.T) {
+	dir := t.TempDir()
+	huge := strings.Repeat("x", scannerMaxLine+1)
+
+	txt := filepath.Join(dir, "amass.txt")
+	if err := os.WriteFile(txt, []byte("api.acme.test\n"+huge+"\nvpn.acme.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	names, err := parseAmassTxt(txt)
+	if err != nil {
+		t.Fatalf("an over-long line should not fail the parse: %v", err)
+	}
+	if len(names) != 1 || names[0] != "api.acme.test" {
+		t.Errorf("names = %v, want everything read before the over-long line", names)
+	}
+
+	jsonFile := filepath.Join(dir, "amass.json")
+	body := `{"name":"api.acme.test","addresses":[{"ip":"10.0.0.7"}]}` + "\n" + huge + "\n"
+	if err := os.WriteFile(jsonFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	records, err := parseAmassJSON(jsonFile)
+	if err != nil {
+		t.Fatalf("an over-long line should not fail the parse: %v", err)
+	}
+	if len(records) != 1 || records[0].Sub != "api.acme.test" {
+		t.Errorf("records = %+v, want the one entry read before the over-long line", records)
+	}
+
+	// With nothing salvaged there is no partial result to prefer, so the
+	// failure is still reported.
+	onlyHuge := filepath.Join(dir, "only-huge.txt")
+	if err := os.WriteFile(onlyHuge, []byte(huge+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseAmassTxt(onlyHuge); err == nil {
+		t.Error("a file yielding nothing but an over-long line should surface the error")
+	}
+}
