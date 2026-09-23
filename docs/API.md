@@ -74,8 +74,16 @@ Enumerates subdomains of `domain` and resolves each to an IP.
 { "jobId": "subdomains-1695000000000000000" }
 ```
 
-**Errors:** `400` missing `domain`/`tenantId` or a non-JSON body;
-`404` the module is disabled or misspelled; `401` bad key.
+**Errors:** `400` missing `domain`/`tenantId`, a non-JSON body, or a
+`domain` that is not a hostname; `404` the module is disabled or
+misspelled; `401` bad key.
+
+`domain` must be a hostname and nothing else: dot-separated labels of
+letters, digits and hyphens, no label starting or ending with a hyphen,
+63 characters per label and 253 overall. Anything else — a leading `-`,
+a space, a slash, a shell metacharacter — is rejected, because the value
+reaches a scanner's command line and `nmap` honours options anywhere on
+it.
 
 ---
 
@@ -172,7 +180,11 @@ Jobs live in memory, so this list resets when the service restarts. In
 
 ## What `mongo` mode writes
 
-**`ScanJob`** — one document per scan, upserted by `jobId`:
+**`ScanJob`** — one document per scan, upserted by `jobId`. The row is
+written as `running` the moment the scan starts, not when it ends, and
+its `count` moves while the scan is under way — so a poller sees the job
+for the whole minutes it takes, and a process killed mid-scan leaves a
+`running` row rather than nothing at all:
 
 | Field | Value |
 |---|---|
@@ -183,7 +195,8 @@ Jobs live in memory, so this list resets when the service restarts. In
 | `status` | `running`, `complete`, `failed` |
 | `count` | Findings |
 | `error` | Failure message, when failed |
-| `startedAt` / `completedAt` | Timestamps (`completedAt` set once the job reaches a terminal status) |
+| `startedAt` / `completedAt` | Timestamps (`startedAt` written when the scan begins, `completedAt` once the job reaches a terminal status) |
+| `createdAt` / `updatedAt` | Mongoose-style timestamps: `createdAt` on insert only, `updatedAt` on every write |
 
 **`CTEMData`** — one document per tenant, keyed by `tenantId`; this tool
 only ever `$set`s the one key it owns per scan:
@@ -200,6 +213,17 @@ only ever `$set`s the one key it owns per scan:
   has nothing open, and there is no hand-added data to preserve the way
   there is for subdomains. Host groups belonging to other root domains
   are left alone.
+
+A newly created `subdomains[]` entry carries `assetCriticality: "Low"`,
+`sslGrade: "N/A"` and `sslDaysRemaining: null`; a host group always
+carries `ip` and each port always carries `version`, as `""` when the
+scan produced none. Entries that are refreshed or retained keep whatever
+is stored.
+
+Both arrays are rewritten whole on a merge, and every key on a row that
+this tool does not itself manage — `_id`, and anything the platform has
+added since — is carried through untouched. A row the scan did not
+return comes back exactly as it was stored.
 
 If writing the result fails, the job is recorded as `failed` (with the
 write error as its `error`) rather than left showing `running` or a
