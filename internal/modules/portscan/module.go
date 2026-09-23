@@ -67,13 +67,25 @@ func (m *Module) RequiredTools() []modules.ToolRequirement {
 // in merge.go, but wrong here — "www.example.com" is a distinct
 // hostname nmap must scan on its own, not a stand-in for the root that
 // should be dropped as a duplicate.
+// Every target is validated as a hostname before it can become one.
+// These strings reach nmap's argv, which honours options anywhere on the
+// command line, and the subdomain values come from STORAGE — a
+// client-requested row beginning with "-" would otherwise be a persisted
+// injection that fires on every later scan. A bad row is skipped, not
+// scanned; an invalid root domain yields no targets at all.
 func BuildTargets(domain string, subs []subdomain.Subdomain) []Target {
+	if !modules.IsValidHostname(domain) {
+		return nil
+	}
 	root := scopeKey(domain)
 	seen := map[string]struct{}{root: {}}
 	targets := []Target{{Host: domain}}
 
 	for _, s := range subs {
 		if s.Sub == "" || !belongsToDomain(s.Sub, domain) {
+			continue
+		}
+		if !modules.IsValidHostname(s.Sub) {
 			continue
 		}
 		key := scopeKey(s.Sub)

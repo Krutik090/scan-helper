@@ -28,6 +28,10 @@ type amassRecord struct {
 // like "domain has no subdomains" to everything downstream. So the
 // command's own error is only consulted once both output sources have
 // come back empty.
+//
+// As with subfinder there is no `--`: the domain is the value of -d, not
+// a positional argument. modules.IsValidHostname in discover is what
+// keeps a non-hostname out of this argv.
 func runAmass(ctx context.Context, bin, domain string, timeoutMinutes int, workDir string) ([]Subdomain, []string, error) {
 	prefix := filepath.Join(workDir, "amass")
 	cmd := exec.CommandContext(ctx, bin,

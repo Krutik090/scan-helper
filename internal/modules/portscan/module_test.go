@@ -34,6 +34,39 @@ func TestBuildTargets_RootPlusItsSubdomainsOnly(t *testing.T) {
 	}
 }
 
+// A stored subdomain row is client-influenced data that ends up in
+// nmap's argv, and nmap honours options anywhere on its command line —
+// so a row that is not a hostname must never become a scan target.
+func TestBuildTargets_SkipsStoredRowsThatAreNotHostnames(t *testing.T) {
+	subs := []subdomain.Subdomain{
+		{Sub: "-oN /etc/cron.d/x", IP: "1.1.1.1"},
+		{Sub: "--script=http-put", IP: "1.1.1.1"},
+		{Sub: "evil.acme.test one.acme.test", IP: "1.1.1.1"},
+		{Sub: "api.acme.test/../x", IP: "1.1.1.1"},
+		{Sub: "api.acme.test;id", IP: "1.1.1.1"},
+		{Sub: "good.acme.test", IP: "1.1.1.1"},
+	}
+	targets := BuildTargets("acme.test", subs)
+
+	if len(targets) != 2 {
+		t.Fatalf("want the root plus the one valid row, got %+v", targets)
+	}
+	if targets[0].Host != "acme.test" || targets[1].Host != "good.acme.test" {
+		t.Fatalf("unexpected targets: %+v", targets)
+	}
+}
+
+func TestBuildTargets_RejectsARootDomainThatIsNotAHostname(t *testing.T) {
+	for _, domain := range []string{"-oN /etc/cron.d/x", "acme.test evil.test", "acme.test/../x", ""} {
+		if targets := BuildTargets(domain, []subdomain.Subdomain{{Sub: "www.acme.test"}}); targets != nil {
+			t.Errorf("BuildTargets(%q) = %+v, want no targets at all", domain, targets)
+		}
+	}
+	if targets := BuildTargets("acme.test", nil); len(targets) != 1 {
+		t.Errorf("a valid root must still yield itself: %+v", targets)
+	}
+}
+
 type fakeLister struct{ targets []Target }
 
 func (f fakeLister) Targets(context.Context, string, string) ([]Target, error) { return f.targets, nil }

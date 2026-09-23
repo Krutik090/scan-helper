@@ -220,6 +220,41 @@ func TestScan_UnknownModuleAndBadRequest(t *testing.T) {
 	}
 }
 
+// TestScan_RejectsADomainThatIsNotAHostname is the API-boundary half of
+// the argv-injection gate: these strings would reach nmap's or
+// subfinder's command line, and nmap honours options anywhere on it.
+func TestScan_RejectsADomainThatIsNotAHostname(t *testing.T) {
+	srv := testServer(t, config.ModeAPIResponse, stubModule{
+		name:   "subdomains",
+		result: map[string]any{"domain": "acme.test"},
+	})
+
+	for name, domain := range map[string]string{
+		"a leading hyphen":  "-oN /etc/cron.d/x",
+		"an nmap option":    "--script=http-put",
+		"a space":           "acme.test evil.test",
+		"a slash":           "acme.test/../etc/passwd",
+		"a shell separator": "acme.test;id",
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := post(t, srv, "/api/v1/scans/subdomains", "test-key", ScanRequest{Domain: domain, TenantID: "t1"})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for domain %q: %s", rec.Code, domain, rec.Body)
+			}
+			if !bytes.Contains(rec.Body.Bytes(), []byte("hostname")) {
+				t.Errorf("the 400 should say what is wrong, got %s", rec.Body)
+			}
+		})
+	}
+
+	t.Run("a normal hostname is accepted", func(t *testing.T) {
+		rec := post(t, srv, "/api/v1/scans/subdomains", "test-key", ScanRequest{Domain: "www.acme.test", TenantID: "t1"})
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body)
+		}
+	})
+}
+
 func TestScan_FailingModuleMarksJobFailed(t *testing.T) {
 	srv := testServer(t, config.ModeAPIResponse, stubModule{name: "subdomains", err: context.DeadlineExceeded})
 

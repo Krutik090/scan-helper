@@ -49,6 +49,15 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "domain is required"})
 		return
 	}
+	// The domain ends up in a scanner's argv, and nmap honours options
+	// anywhere on its command line. Reject anything that is not purely a
+	// hostname here, before a job exists — not deep inside a module.
+	if !modules.IsValidHostname(req.Domain) {
+		writeJSON(w, http.StatusBadRequest, errorResponse{
+			Error: "domain must be a hostname: letters, digits and hyphens in dot-separated labels, no leading hyphen",
+		})
+		return
+	}
 	if req.TenantID == "" {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "tenantId is required"})
 		return

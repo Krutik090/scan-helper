@@ -13,6 +13,12 @@ const scannerMaxLine = 1024 * 1024
 // runSubfinder streams subfinder's stdout line by line as it arrives.
 // A busy domain can return tens of thousands of names; buffering the
 // whole output and splitting it afterwards would hold all of it twice.
+//
+// There is no `--` here, unlike the nmap invocation: the domain is the
+// VALUE of -d, not a positional argument, so `--` has nowhere to go that
+// would guard it — it would only become a stray positional. What guards
+// this call is modules.IsValidHostname, applied in discover before
+// either tool is invoked.
 func runSubfinder(ctx context.Context, bin, domain string) ([]string, error) {
 	cmd := exec.CommandContext(ctx, bin, "-d", domain, "-silent")
 	cmd.Env = os.Environ()

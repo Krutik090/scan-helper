@@ -17,11 +17,18 @@ type scanFunc func(ctx context.Context, target string) ([]Port, string, error)
 // -sV service/version detection, --open open ports only, -T4 timing, and
 // nmap's default top-1000 ports (no -p). `-oX -` streams XML to stdout,
 // so there is no temp file to create, read back, or clean up.
+//
+// The `--` before the target is defence in depth behind
+// modules.IsValidHostname: nmap honours options anywhere on its command
+// line, so without it a target of `-oN /etc/cron.d/x` is an option, not
+// a host. Verified against nmap 7.98: without `--` that argument writes
+// the file; with it, nmap reports "Unable to split netmask from target
+// expression" and writes nothing.
 func runNmap(ctx context.Context, bin, target string, timeout time.Duration) ([]Port, string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, bin, "-sV", "--open", "-T4", "-oX", "-", target)
+	cmd := exec.CommandContext(runCtx, bin, "-sV", "--open", "-T4", "-oX", "-", "--", target)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

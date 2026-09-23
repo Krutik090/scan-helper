@@ -76,6 +76,13 @@ func (m *Module) Run(ctx context.Context, params modules.RunParams, onProgress f
 // fallback — these still need resolving) OR entries amass already
 // resolved addresses for.
 func (m *Module) discover(ctx context.Context, domain string) (names []string, preResolved []Subdomain, err error) {
+	// Nothing that is not purely a hostname reaches a scanner's argv.
+	// The API rejects a bad domain first; this is the module's own gate,
+	// so a future caller that is not the API cannot skip it.
+	if !modules.IsValidHostname(domain) {
+		return nil, nil, fmt.Errorf("%q is not a valid hostname", domain)
+	}
+
 	if m.cfg.SubfinderBin != "" && toolcheck.Present(m.cfg.SubfinderBin) {
 		names, err = runSubfinder(ctx, m.cfg.SubfinderBin, domain)
 		if err == nil && len(names) > 0 {
