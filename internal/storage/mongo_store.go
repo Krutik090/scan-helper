@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -89,6 +90,15 @@ func (m *MongoSink) Close(ctx context.Context) error {
 
 // Save writes the job's ScanJob document and, for a complete job, merges
 // its result into CTEMData.
+//
+// If the result write fails (an unrecognised Result type, or a Mongo
+// error inside saveSubdomains/savePorts), Save does NOT leave ScanJob
+// stuck at "running" — index.js swallowed that error and reported
+// "complete" for data that was never written, which is worse: the
+// ThreatIntel backend would see a false success. Instead the job is
+// re-marked failed, with the result-write error recorded, and that
+// accurate terminal status is what gets written — then the original
+// error is still returned to the caller.
 func (m *MongoSink) Save(ctx context.Context, job jobs.Job) error {
 	tenantID, err := primitive.ObjectIDFromHex(job.TenantID)
 	if err != nil {
@@ -96,11 +106,34 @@ func (m *MongoSink) Save(ctx context.Context, job jobs.Job) error {
 	}
 
 	if job.Status == jobs.StatusComplete {
-		if err := m.saveResult(ctx, tenantID, job); err != nil {
-			return err
+		if resultErr := m.saveResult(ctx, tenantID, job); resultErr != nil {
+			failed := job
+			failed.Status = jobs.StatusFailed
+			failed.Error = resultErr.Error()
+			failed.CompletedAt = completedAtFor(failed)
+			if saveErr := m.saveScanJob(ctx, tenantID, failed); saveErr != nil {
+				return errors.Join(resultErr, fmt.Errorf("also writing failed ScanJob status: %w", saveErr))
+			}
+			return resultErr
 		}
 	}
 	return m.saveScanJob(ctx, tenantID, job)
+}
+
+// completedAtFor returns the completedAt to write for job. A terminal job
+// must carry one even if the caller built the job value directly rather
+// than going through jobs.Store.SetStatus (which normally stamps it) —
+// the ThreatIntel backend depends on this field being present once a job
+// is done.
+func completedAtFor(job jobs.Job) *time.Time {
+	if job.CompletedAt != nil {
+		return job.CompletedAt
+	}
+	if job.Status == jobs.StatusComplete || job.Status == jobs.StatusFailed {
+		now := time.Now()
+		return &now
+	}
+	return nil
 }
 
 func (m *MongoSink) saveScanJob(ctx context.Context, tenantID primitive.ObjectID, job jobs.Job) error {
@@ -117,16 +150,7 @@ func (m *MongoSink) saveScanJob(ctx context.Context, tenantID primitive.ObjectID
 	if job.Error != "" {
 		doc["error"] = job.Error
 	}
-	// A terminal job must carry completedAt even if the caller built the
-	// job struct directly rather than going through jobs.Store.SetStatus
-	// (which normally stamps it) — the ThreatIntel backend depends on
-	// this field being present once a job is done.
-	completedAt := job.CompletedAt
-	if completedAt == nil && (job.Status == jobs.StatusComplete || job.Status == jobs.StatusFailed) {
-		now := time.Now()
-		completedAt = &now
-	}
-	if completedAt != nil {
+	if completedAt := completedAtFor(job); completedAt != nil {
 		doc["completedAt"] = *completedAt
 	}
 

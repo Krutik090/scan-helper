@@ -169,3 +169,37 @@ func TestMongoSink_TargetsComeFromStoredSubdomains(t *testing.T) {
 		t.Fatalf("want the root plus its one in-domain subdomain, got %+v", targets)
 	}
 }
+
+// unrecognisedResult is neither subdomain.Result nor portscan.Result, so
+// saveResult hits its default branch.
+type unrecognisedResult struct {
+	Foo string
+}
+
+func TestMongoSink_ResultWriteFailureStillRecordsTerminalStatus(t *testing.T) {
+	sink := testMongo(t)
+	ctx := context.Background()
+
+	job := jobs.Job{
+		ID: "job-4", Module: "ports", TenantID: "6a7dc0f5458d051280d196b1", Domain: "acme.test",
+		Status: jobs.StatusComplete, Count: 1,
+		Result: unrecognisedResult{Foo: "bar"},
+	}
+	if err := sink.Save(ctx, job); err == nil {
+		t.Fatal("Save: want an error for an unrecognised result type, got nil")
+	}
+
+	var doc ScanJobDoc
+	if err := sink.db.Collection("ScanJob").FindOne(ctx, bson.M{"jobId": "job-4"}).Decode(&doc); err != nil {
+		t.Fatalf("reading ScanJob: %v", err)
+	}
+	if doc.Status != "failed" {
+		t.Errorf("status = %q, want failed — a result-write failure must not leave ScanJob stuck at running", doc.Status)
+	}
+	if doc.Error == "" {
+		t.Error("want a non-empty error field recording why the save failed")
+	}
+	if doc.CompletedAt == nil {
+		t.Error("want completedAt stamped even though the job never reached a clean complete")
+	}
+}
