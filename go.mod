@@ -3,6 +3,7 @@ module github.com/Krutik090/scan-helper
 go 1.22
 
 require (
+	github.com/go-chi/chi/v5 v5.2.5
 	go.mongodb.org/mongo-driver v1.17.10
 	gopkg.in/yaml.v3 v3.0.1
 )
