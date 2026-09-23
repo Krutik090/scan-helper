@@ -138,6 +138,18 @@ if [[ "$ENABLE_PORTSCAN" == "true" ]]; then
   done < <(printf '%s\n' "$TOOLS_MANIFEST" | awk -F: '$1=="ports"{print $2}')
 fi
 
+# Everything install_subfinder downloads or unpacks lives in one
+# directory, removed on EVERY exit path — including the `die`s below,
+# which exit the script outright. The old code cleaned up file by file
+# and missed a case: a checksums download that failed part-way left its
+# partial file in /tmp, where the next run's `awk` would read it.
+SUBFINDER_TMPDIR=""
+cleanup_subfinder_tmp() {
+  [[ -n "$SUBFINDER_TMPDIR" ]] || return 0
+  rm -rf "$SUBFINDER_TMPDIR"
+  SUBFINDER_TMPDIR=""
+}
+
 install_subfinder() {
   local arch tarball checksums expected actual
   case "$(uname -m)" in
@@ -147,8 +159,12 @@ install_subfinder() {
   esac
   tarball="subfinder_${SUBFINDER_VERSION}_linux_${arch}.zip"
   checksums="subfinder_${SUBFINDER_VERSION}_checksums.txt"
+
+  SUBFINDER_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/scanhelper-subfinder.XXXXXX")"
+  trap cleanup_subfinder_tmp EXIT
+
   info "Installing subfinder ${SUBFINDER_VERSION}"
-  curl -fsSL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/${tarball}" -o "/tmp/${tarball}"
+  curl -fsSL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/${tarball}" -o "${SUBFINDER_TMPDIR}/${tarball}"
 
   # A security tool fetched over the network and dropped into
   # /usr/local/bin must be verified before it's installed — an HTTP 200
@@ -156,28 +172,25 @@ install_subfinder() {
   # projectdiscovery actually published. Verify against the checksums
   # file published alongside the same release; refuse to install, with
   # no fallback to installing unverified, if either step fails.
-  if ! curl -fsSL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/${checksums}" -o "/tmp/${checksums}"; then
-    rm -f "/tmp/${tarball}"
+  if ! curl -fsSL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VERSION}/${checksums}" -o "${SUBFINDER_TMPDIR}/${checksums}"; then
     die "Could not download ${checksums} to verify the subfinder download — refusing to install an unverified binary."
   fi
 
-  expected="$(awk -v f="$tarball" '$2==f{print $1}' "/tmp/${checksums}")"
+  expected="$(awk -v f="$tarball" '$2==f{print $1}' "${SUBFINDER_TMPDIR}/${checksums}")"
   if [[ -z "$expected" ]]; then
-    rm -f "/tmp/${tarball}" "/tmp/${checksums}"
     die "No checksum entry for ${tarball} in ${checksums} — refusing to install an unverified binary."
   fi
 
-  actual="$(sha256sum "/tmp/${tarball}" | awk '{print $1}')"
+  actual="$(sha256sum "${SUBFINDER_TMPDIR}/${tarball}" | awk '{print $1}')"
   if [[ "$actual" != "$expected" ]]; then
-    rm -f "/tmp/${tarball}" "/tmp/${checksums}"
     die "subfinder checksum mismatch: expected ${expected}, got ${actual} — refusing to install."
   fi
   ok "subfinder checksum verified (sha256 ${actual})"
 
   $SUDO apt-get install -y unzip >/dev/null
-  unzip -oq "/tmp/${tarball}" -d /tmp/subfinder-install
-  $SUDO install -m 0755 /tmp/subfinder-install/subfinder /usr/local/bin/subfinder
-  rm -rf "/tmp/${tarball}" "/tmp/${checksums}" /tmp/subfinder-install
+  unzip -oq "${SUBFINDER_TMPDIR}/${tarball}" -d "${SUBFINDER_TMPDIR}/unpacked"
+  $SUDO install -m 0755 "${SUBFINDER_TMPDIR}/unpacked/subfinder" /usr/local/bin/subfinder
+  cleanup_subfinder_tmp
 }
 
 install_tool() {
@@ -261,12 +274,24 @@ YAML
   chmod 600 config.yaml
 }
 
-# yaml_value: pull a quoted scalar out of the existing config.yaml by key,
+# yaml_value: pull a QUOTED scalar out of the existing config.yaml by key,
 # e.g. `api_key: "..."` or `uri: "..."`. Never fails the script even when
 # the key is absent (set -e would otherwise abort on grep's no-match exit
 # status) — callers just get an empty string.
+#
+# The match is the whole line, so anything that is not a properly quoted
+# scalar yields empty rather than passing through verbatim. The previous
+# version matched on the key alone and let sed fall through unchanged
+# when there were no quotes to capture, so a hand-edited or unquoted line
+# — `api_key: hunter2 # note`, or a YAML block scalar — was returned as
+# its own raw text and then embedded, quotes and comment and all, into
+# the regenerated config. Every value this reads is written straight back
+# out inside double quotes, so anything but a clean quoted scalar has to
+# be treated as "not found" and re-prompted for.
 yaml_value() {
-  grep -m1 -E "^[[:space:]]*${2}:" "$1" 2>/dev/null | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true
+  local line
+  line="$(grep -m1 -E "^[[:space:]]*${2}:[[:space:]]*\"[^\"]*\"[[:space:]]*(#.*)?$" "$1" 2>/dev/null)" || return 0
+  printf '%s\n' "$line" | sed -E 's/^[^"]*"([^"]*)".*/\1/'
 }
 
 EXISTING_API_KEY=""
