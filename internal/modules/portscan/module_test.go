@@ -160,3 +160,26 @@ func TestModule_RunFailsClearlyWithoutNmap(t *testing.T) {
 		t.Fatalf("expected a clear nmap-missing error, got %v", err)
 	}
 }
+
+// TestModule_AcceptsBareNmapBinResolvedOnPATH guards the presence check
+// itself: the module used to gate on a local os.Stat-based fileExists,
+// which fails for a bare command name (no path separator) even when that
+// name resolves fine on PATH — nmap_bin's config default is now exactly
+// such a bare name ("nmap"). "true" stands in for nmap here: it is a
+// bare name virtually guaranteed to be on PATH, so if the presence gate
+// still rejected bare names we'd see the old "nmap is not available at"
+// error. Instead we expect the run to get past the gate and fail later,
+// for an entirely different reason (a real nmap invocation against
+// "true" doesn't produce nmap XML).
+func TestModule_AcceptsBareNmapBinResolvedOnPATH(t *testing.T) {
+	m := New(Config{NmapBin: "true", TimeoutMinutes: 1, WorkerPool: 1},
+		fakeLister{targets: []Target{{Host: "acme.test"}}})
+
+	_, err := m.Run(context.Background(), modules.RunParams{JobID: "j", Domain: "acme.test"}, nil)
+	if err == nil {
+		t.Fatal("expected an error, since \"true\" does not behave like nmap")
+	}
+	if strings.Contains(err.Error(), "is not available") {
+		t.Errorf("presence check rejected the bare, PATH-resolvable nmap_bin %q: %v", "true", err)
+	}
+}

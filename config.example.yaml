@@ -19,13 +19,16 @@ mongo:
 modules:
   subdomain:
     enabled: true
-    # Leave subfinder_bin empty to always use amass.
-    subfinder_bin: "/root/go/bin/subfinder"
-    amass_bin: "/usr/lib/amass/amass"
+    # A bare name (the default) is looked up on PATH at run time; give an
+    # absolute path instead to pin a specific binary. Leave subfinder_bin
+    # empty (subfinder_bin: "") to always use amass.
+    subfinder_bin: "subfinder"
+    amass_bin: "amass"
     timeout_minutes: 5
     resolver_workers: 50
   portscan:
     enabled: true
-    nmap_bin: "/usr/bin/nmap"
+    # Same rule: a bare name resolves on PATH, or give an absolute path.
+    nmap_bin: "nmap"
     timeout_minutes: 10
     worker_pool: 5

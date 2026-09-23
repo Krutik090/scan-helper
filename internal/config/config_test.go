@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -78,5 +79,35 @@ func TestValidate_RefusesUnsafeOrImpossibleConfigs(t *testing.T) {
 func TestLoad_MissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Fatal("expected an error for a missing config file")
+	}
+}
+
+// TestDefaults_ToolBinariesAreBareNamesResolvedOnPATH guards against
+// reintroducing a distro-specific absolute path (e.g. Kali's
+// /usr/lib/amass/amass, which doesn't exist on the Ubuntu box setup.sh
+// targets — apt puts it at /usr/bin/amass). A bare command name is
+// resolved through PATH at run time by toolcheck.Present, so it works
+// regardless of which distro's package layout installed the binary, and
+// it's also what makes -print-tools able to report every tool without
+// requiring a config file first.
+func TestDefaults_ToolBinariesAreBareNamesResolvedOnPATH(t *testing.T) {
+	d := Defaults()
+	cases := map[string]string{
+		"modules.subdomain.subfinder_bin": d.Modules.Subdomain.SubfinderBin,
+		"modules.subdomain.amass_bin":     d.Modules.Subdomain.AmassBin,
+		"modules.portscan.nmap_bin":       d.Modules.Portscan.NmapBin,
+	}
+	want := map[string]string{
+		"modules.subdomain.subfinder_bin": "subfinder",
+		"modules.subdomain.amass_bin":     "amass",
+		"modules.portscan.nmap_bin":       "nmap",
+	}
+	for field, got := range cases {
+		if got != want[field] {
+			t.Errorf("%s = %q, want bare command name %q", field, got, want[field])
+		}
+		if strings.ContainsAny(got, `/\`) {
+			t.Errorf("%s = %q looks like a path, not a bare command name", field, got)
+		}
 	}
 }

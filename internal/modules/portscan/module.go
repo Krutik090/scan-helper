@@ -5,13 +5,13 @@ package portscan
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Krutik090/scan-helper/internal/modules"
 	"github.com/Krutik090/scan-helper/internal/modules/subdomain"
+	"github.com/Krutik090/scan-helper/internal/toolcheck"
 )
 
 // Name is the module's API name: POST /api/v1/scans/ports.
@@ -94,7 +94,7 @@ func scopeKey(s string) string {
 }
 
 func (m *Module) Run(ctx context.Context, params modules.RunParams, onProgress func(int)) (any, error) {
-	if !fileExists(m.cfg.NmapBin) {
+	if !toolcheck.Present(m.cfg.NmapBin) {
 		return nil, fmt.Errorf("nmap is not available at %q", m.cfg.NmapBin)
 	}
 
@@ -211,9 +211,4 @@ func scanTargets(
 		return nil, fmt.Errorf("all %d targets failed scanning %s: %w", failCount, domain, lastErr)
 	}
 	return groups, nil
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

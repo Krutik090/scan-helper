@@ -42,3 +42,29 @@ func TestModule_RunFailsClearlyWhenNoToolIsAvailable(t *testing.T) {
 		t.Errorf("error should name the domain it failed on, got %q", err)
 	}
 }
+
+// TestModule_AcceptsBareAmassBinResolvedOnPATH guards the presence check
+// itself: the module used to gate on a local os.Stat-based fileExists,
+// which fails for a bare command name (no path separator) even when
+// that name resolves fine on PATH — amass_bin's config default is now
+// exactly such a bare name ("amass"). "true" stands in for amass here:
+// it is a bare name virtually guaranteed to be on PATH. Run "true" as
+// amass exits 0 with no output files, which amass.go treats as a clean,
+// empty success — so if the presence gate still rejected bare names,
+// Run would fail with "no usable tool"; instead it must succeed with an
+// empty result, proving the gate accepted the PATH-resolved name.
+func TestModule_AcceptsBareAmassBinResolvedOnPATH(t *testing.T) {
+	m := New(Config{AmassBin: "true", TimeoutMinutes: 1, ResolverWorkers: 4})
+
+	res, err := m.Run(context.Background(), modules.RunParams{JobID: "j1", Domain: "acme.test"}, nil)
+	if err != nil {
+		t.Fatalf("presence check rejected the bare, PATH-resolvable amass_bin %q: %v", "true", err)
+	}
+	result, ok := res.(Result)
+	if !ok {
+		t.Fatalf("unexpected result type %T", res)
+	}
+	if result.Domain != "acme.test" {
+		t.Errorf("Domain = %q, want acme.test", result.Domain)
+	}
+}

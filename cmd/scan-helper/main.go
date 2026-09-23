@@ -35,7 +35,7 @@ func main() {
 	// has none yet, and config.Load hard-fails on a missing file. So this
 	// path never touches config.Load: it builds the registry straight
 	// from config.Defaults(), with every module enabled, and never
-	// reaches the logger or config validation below.
+	// reaches the logger, config validation, or run() below.
 	if *printTools {
 		reg := buildRegistry(config.Defaults(), nil)
 		fmt.Println(toolsManifest(reg))
@@ -44,10 +44,22 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		logger.Error("configuration", "error", err)
+	if err := run(*configPath, logger); err != nil {
+		logger.Error("scan-helper exited", "error", err)
 		os.Exit(1)
+	}
+}
+
+// run owns every deferred cleanup (context cancellation, the storage
+// sink's Close) for the whole server lifetime. It must never call
+// os.Exit itself — doing so would skip those defers on an error path,
+// which is exactly the bug this shape avoids: main is the only place
+// that exits, and only after run has returned and every defer here has
+// already run.
+func run(configPath string, logger *slog.Logger) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("configuration: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -55,8 +67,7 @@ func main() {
 
 	sink, lister, err := buildStorage(ctx, cfg, logger)
 	if err != nil {
-		logger.Error("storage", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("storage: %w", err)
 	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -76,10 +87,10 @@ func main() {
 	})
 
 	if err := server.ListenAndServe(ctx); err != nil {
-		logger.Error("server stopped", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("server stopped: %w", err)
 	}
 	logger.Info("shut down cleanly")
+	return nil
 }
 
 func configPathDefault() string {

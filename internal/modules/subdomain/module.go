@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Krutik090/scan-helper/internal/modules"
+	"github.com/Krutik090/scan-helper/internal/toolcheck"
 )
 
 // Name is the module's API name: POST /api/v1/scans/subdomains.
@@ -75,7 +76,7 @@ func (m *Module) Run(ctx context.Context, params modules.RunParams, onProgress f
 // fallback — these still need resolving) OR entries amass already
 // resolved addresses for.
 func (m *Module) discover(ctx context.Context, domain string) (names []string, preResolved []Subdomain, err error) {
-	if m.cfg.SubfinderBin != "" && fileExists(m.cfg.SubfinderBin) {
+	if m.cfg.SubfinderBin != "" && toolcheck.Present(m.cfg.SubfinderBin) {
 		names, err = runSubfinder(ctx, m.cfg.SubfinderBin, domain)
 		if err == nil && len(names) > 0 {
 			return names, nil, nil
@@ -83,7 +84,7 @@ func (m *Module) discover(ctx context.Context, domain string) (names []string, p
 		// Fall through to amass, same as the Node implementation did.
 	}
 
-	if !fileExists(m.cfg.AmassBin) {
+	if !toolcheck.Present(m.cfg.AmassBin) {
 		return nil, nil, fmt.Errorf("no usable tool: subfinder %q and amass %q are both unavailable",
 			m.cfg.SubfinderBin, m.cfg.AmassBin)
 	}
@@ -102,9 +103,4 @@ func (m *Module) discover(ctx context.Context, domain string) (names []string, p
 		return nil, records, nil
 	}
 	return txtNames, nil, nil
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

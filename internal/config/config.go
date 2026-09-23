@@ -73,14 +73,14 @@ func defaults() Config {
 		Modules: ModulesConfig{
 			Subdomain: SubdomainModuleConfig{
 				Enabled:         true,
-				SubfinderBin:    "",
-				AmassBin:        "/usr/lib/amass/amass",
+				SubfinderBin:    "subfinder",
+				AmassBin:        "amass",
 				TimeoutMinutes:  5,
 				ResolverWorkers: 50,
 			},
 			Portscan: PortscanModuleConfig{
 				Enabled:        true,
-				NmapBin:        "/usr/bin/nmap",
+				NmapBin:        "nmap",
 				TimeoutMinutes: 10,
 				WorkerPool:     5,
 			},
