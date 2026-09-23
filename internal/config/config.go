@@ -57,6 +57,14 @@ type Config struct {
 	Modules ModulesConfig `yaml:"modules"`
 }
 
+// Defaults returns the built-in configuration defaults, with every module
+// enabled. It exists so callers can inspect what the binary needs (tool
+// paths, etc.) before any config file exists — see cmd/scan-helper's
+// -print-tools flag, which must work on a fresh box with no config.yaml.
+func Defaults() Config {
+	return defaults()
+}
+
 func defaults() Config {
 	return Config{
 		Server: ServerConfig{Port: 4001},
