@@ -1,0 +1,31 @@
+# scan-helper configuration. Copy to config.yaml and edit.
+# Anything you leave out keeps the default shown here.
+
+server:
+  port: 4001
+  # REQUIRED. Every request except GET /api/v1/health must send this as
+  # the X-API-Key header. The server refuses to start if it is empty.
+  api_key: "change-me"
+
+# "mongo"        -> results are written straight into MongoDB (below).
+# "api_response" -> results come back in GET /api/v1/jobs/{id}; no DB needed.
+mode: mongo
+
+mongo:
+  # Only read when mode is "mongo". Put credentials in the URI:
+  #   mongodb://user:password@host:27017/ThreatIntel
+  uri: "mongodb://localhost:27017/ThreatIntel"
+
+modules:
+  subdomain:
+    enabled: true
+    # Leave subfinder_bin empty to always use amass.
+    subfinder_bin: "/root/go/bin/subfinder"
+    amass_bin: "/usr/lib/amass/amass"
+    timeout_minutes: 5
+    resolver_workers: 50
+  portscan:
+    enabled: true
+    nmap_bin: "/usr/bin/nmap"
+    timeout_minutes: 10
+    worker_pool: 5
