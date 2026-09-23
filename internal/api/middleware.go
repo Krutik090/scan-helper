@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"log/slog"
 	"net/http"
 	"time"
@@ -9,10 +10,17 @@ import (
 // requireAPIKey rejects anything without the configured X-API-Key. The
 // config layer refuses to start with an empty key, so this can never
 // degrade into "no auth".
+//
+// The comparison is constant-time. Go's == on strings returns as soon as
+// two bytes differ, so how long a rejection takes leaks how much of the
+// key the caller got right — enough, over many requests, to recover it a
+// byte at a time. This is an auth primitive and the correct comparison
+// costs nothing.
 func requireAPIKey(key string) func(http.Handler) http.Handler {
+	expected := []byte(key)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("X-API-Key") != key {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-API-Key")), expected) != 1 {
 				writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid or missing X-API-Key"})
 				return
 			}
