@@ -1,3 +1,5 @@
 /scan-helper
 config.yaml
 *.test
+.env
+.env.*
