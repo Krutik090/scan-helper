@@ -178,9 +178,23 @@ URI: `mongodb://localhost:27017/ThreatIntel`.
 ## Development
 
 ```bash
-make test     # go test ./... -race
-make build    # go build -o scan-helper ./cmd/scan-helper
-make run      # build, then ./scan-helper -config ./config.yaml
+make test      # go test ./... -count=1
+make test-race # the same under the race detector (needs cgo and a C toolchain)
+make build     # go build -o scan-helper ./cmd/scan-helper
+make run       # build, then ./scan-helper -config ./config.yaml
+```
+
+`make test` runs everywhere. `make test-race` needs a C compiler, since
+the race detector is built on cgo — it is the right target for CI, and it
+will not run on a box without one.
+
+The storage tests skip unless `SCAN_HELPER_TEST_MONGO_URI` points at a
+throwaway database; they delete the collections they use, so never point
+them at a real one:
+
+```bash
+SCAN_HELPER_TEST_MONGO_URI=mongodb://localhost:27017/scanhelper_test \
+  go test ./internal/storage/ -count=1
 ```
 
 `./scan-helper -print-tools` prints one `module:tool` line per tool every
