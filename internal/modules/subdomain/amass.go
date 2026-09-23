@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,10 +20,14 @@ type amassRecord struct {
 }
 
 // runAmass runs `amass enum -oA <prefix>` and reads back what it wrote.
-// amass's own exit code is not a reliable signal, so the output files
-// are what decide success — the JSON file first (it carries addresses
-// amass already resolved), falling back to the plain name list. Same
-// order the Node implementation used.
+// amass's own exit code is not a reliable signal on its own — a non-zero
+// exit with usable output in either file is still tolerated, same as the
+// Node implementation did. But an exit that produced NEITHER file is a
+// different case entirely: a crash, a bad binary, no network — and
+// reporting that as a clean empty result would let a real failure look
+// like "domain has no subdomains" to everything downstream. So the
+// command's own error is only consulted once both output sources have
+// come back empty.
 func runAmass(ctx context.Context, bin, domain string, timeoutMinutes int, workDir string) ([]Subdomain, []string, error) {
 	prefix := filepath.Join(workDir, "amass")
 	cmd := exec.CommandContext(ctx, bin,
@@ -32,7 +37,7 @@ func runAmass(ctx context.Context, bin, domain string, timeoutMinutes int, workD
 		"-oA", prefix,
 	)
 	cmd.Env = os.Environ()
-	_ = cmd.Run()
+	runErr := cmd.Run()
 
 	records, err := parseAmassJSON(prefix + ".json")
 	if err != nil {
@@ -46,7 +51,16 @@ func runAmass(ctx context.Context, bin, domain string, timeoutMinutes int, workD
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, names, nil
+	if len(names) > 0 {
+		return nil, names, nil
+	}
+
+	// Neither file had anything. If the command itself failed, that's
+	// why — surface it rather than returning a silent empty success.
+	if runErr != nil {
+		return nil, nil, fmt.Errorf("amass (%s) produced no output for %s: %w", bin, domain, runErr)
+	}
+	return nil, nil, nil
 }
 
 // parseAmassJSON reads amass's JSON output: one object per line, NOT a
