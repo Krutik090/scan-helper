@@ -7,12 +7,18 @@ import "time"
 // driver would lowercase these names without them, which the backend
 // does not expect.
 type Subdomain struct {
-	Sub              string     `json:"sub" bson:"sub"`
-	IP               string     `json:"ip" bson:"ip"`
-	Status           string     `json:"status" bson:"status"`
-	AssetCriticality string     `json:"assetCriticality,omitempty" bson:"assetCriticality,omitempty"`
-	SSLGrade         string     `json:"sslGrade,omitempty" bson:"sslGrade,omitempty"`
-	SSLDaysRemaining *int       `json:"sslDaysRemaining,omitempty" bson:"sslDaysRemaining,omitempty"`
+	Sub              string `json:"sub" bson:"sub"`
+	IP               string `json:"ip" bson:"ip"`
+	Status           string `json:"status" bson:"status"`
+	AssetCriticality string `json:"assetCriticality,omitempty" bson:"assetCriticality,omitempty"`
+	SSLGrade         string `json:"sslGrade,omitempty" bson:"sslGrade,omitempty"`
+	// No bson omitempty: index.js wrote `sslDaysRemaining: null` on every
+	// row it created, and the platform reads the key. With omitempty a
+	// nil would simply vanish from the document — a newly created row
+	// would lack the key, and a stored row whose value IS null would lose
+	// it on the next merge. The JSON tag keeps omitempty: the API
+	// response shape is not part of the Mongo contract.
+	SSLDaysRemaining *int       `json:"sslDaysRemaining,omitempty" bson:"sslDaysRemaining"`
 	SSLExpiresAt     *time.Time `json:"sslExpiresAt,omitempty" bson:"sslExpiresAt,omitempty"`
 	RootDomain       string     `json:"rootDomain,omitempty" bson:"rootDomain,omitempty"`
 	OwnerName        string     `json:"ownerName,omitempty" bson:"ownerName,omitempty"`

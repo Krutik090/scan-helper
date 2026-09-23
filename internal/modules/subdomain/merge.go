@@ -105,6 +105,15 @@ func Merge(existing, fresh []Subdomain, domain string, now time.Time) MergeResul
 			t := now
 			entry.Source = "scan"
 			entry.AddedAt = &t
+			// The starting values index.js gave every row it created.
+			// The platform expects the keys to be present on a new row:
+			// criticality is what an analyst raises from, and the SSL
+			// fields are what the per-entry check later fills in. Only
+			// NEW rows get these — an updated or retained row keeps
+			// whatever is stored, which is set below and above.
+			entry.AssetCriticality = "Low"
+			entry.SSLGrade = "N/A"
+			entry.SSLDaysRemaining = nil
 			out = append(out, entry)
 			created++
 			continue

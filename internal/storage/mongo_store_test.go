@@ -323,6 +323,98 @@ func TestMongoSink_UnknownStoredFieldsSurviveAPortMerge(t *testing.T) {
 	}
 }
 
+// TestMongoSink_NewRowsCarryThePlatformDefaults pins the starting values
+// index.js gave every row it created. The keys have to be PRESENT on a
+// new row — the platform reads them — and an updated or retained row has
+// to keep whatever is stored instead.
+func TestMongoSink_NewRowsCarryThePlatformDefaults(t *testing.T) {
+	sink := testMongo(t)
+	ctx := context.Background()
+	tenant := "6a7dc0f5458d051280d196c4"
+
+	thirty := 30
+	seedCTEM(t, sink, tenant, []subdomain.Subdomain{
+		{Sub: "www.acme.test", IP: "1.1.1.1", Status: "Active",
+			AssetCriticality: "High", SSLGrade: "A+", SSLDaysRemaining: &thirty},
+	})
+
+	job := jobs.Job{
+		ID: "job-defaults", Module: "subdomains", TenantID: tenant, Domain: "acme.test",
+		Status: jobs.StatusComplete, Count: 2,
+		Result: subdomain.Result{Domain: "acme.test", Subdomains: []subdomain.Subdomain{
+			{Sub: "www.acme.test", IP: "9.9.9.9"}, // updated
+			{Sub: "new.acme.test", IP: "8.8.8.8"}, // created
+		}},
+	}
+	if err := sink.Save(ctx, job); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	rows := rawArray(t, sink, tenant, "subdomains")
+	bySub := map[string]bson.M{}
+	for _, r := range rows {
+		bySub[asString(r["sub"])] = r
+	}
+
+	created := bySub["new.acme.test"]
+	if created["assetCriticality"] != "Low" {
+		t.Errorf("a new row's assetCriticality = %v, want %q", created["assetCriticality"], "Low")
+	}
+	if created["sslGrade"] != "N/A" {
+		t.Errorf("a new row's sslGrade = %v, want %q", created["sslGrade"], "N/A")
+	}
+	if _, present := created["sslDaysRemaining"]; !present {
+		t.Errorf("a new row must carry sslDaysRemaining (as null): %+v", created)
+	} else if created["sslDaysRemaining"] != nil {
+		t.Errorf("a new row's sslDaysRemaining = %v, want null", created["sslDaysRemaining"])
+	}
+
+	updated := bySub["www.acme.test"]
+	if updated["assetCriticality"] != "High" || updated["sslGrade"] != "A+" {
+		t.Errorf("an updated row must keep the stored values, got %+v", updated)
+	}
+	if got, _ := updated["sslDaysRemaining"].(int32); got != 30 {
+		t.Errorf("an updated row's sslDaysRemaining = %v, want 30", updated["sslDaysRemaining"])
+	}
+}
+
+func TestMongoSink_PortRowsAlwaysCarryIPAndVersion(t *testing.T) {
+	sink := testMongo(t)
+	ctx := context.Background()
+	tenant := "6a7dc0f5458d051280d196c5"
+
+	job := jobs.Job{
+		ID: "job-port-keys", Module: "ports", TenantID: tenant, Domain: "acme.test",
+		Status: jobs.StatusComplete, Count: 1,
+		Result: portscan.Result{Domain: "acme.test", HostGroups: []portscan.HostGroup{
+			// Neither an address nor a version came back from this scan;
+			// index.js still emitted both keys, as ''.
+			{Host: "www.acme.test", Ports: []portscan.Port{
+				{Port: 22, Protocol: "tcp", Service: "ssh", State: "Open", Risk: "Low"},
+			}, RootDomain: "acme.test"},
+		}},
+	}
+	if err := sink.Save(ctx, job); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	rows := rawArray(t, sink, tenant, "openPorts")
+	if len(rows) != 1 {
+		t.Fatalf("want one host group, got %+v", rows)
+	}
+	if got, present := rows[0]["ip"]; !present || got != "" {
+		t.Errorf("host group ip = %v (present=%v), want an empty string", got, present)
+	}
+	ports, _ := rows[0]["ports"].(primitive.A)
+	if len(ports) != 1 {
+		t.Fatalf("want one port, got %+v", rows[0]["ports"])
+	}
+	port, _ := ports[0].(bson.M)
+	if got, present := port["version"]; !present || got != "" {
+		t.Errorf("port version = %v (present=%v), want an empty string", got, present)
+	}
+}
+
 // TestMongoSink_JobIsVisibleWhileItRuns covers the lifecycle the external
 // backend polls: a ScanJob row exists as "running" from the moment the
 // scan starts, its count moves while the scan is under way, and only

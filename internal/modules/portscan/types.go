@@ -6,9 +6,11 @@ type Port struct {
 	Port     int    `json:"port" bson:"port"`
 	Protocol string `json:"protocol" bson:"protocol"`
 	Service  string `json:"service" bson:"service"`
-	Version  string `json:"version,omitempty" bson:"version,omitempty"`
-	State    string `json:"state" bson:"state"`
-	Risk     string `json:"risk" bson:"risk"`
+	// index.js always emitted version, as '' when nmap reported none, so
+	// no bson omitempty here — the key is part of what the platform reads.
+	Version string `json:"version,omitempty" bson:"version"`
+	State   string `json:"state" bson:"state"`
+	Risk    string `json:"risk" bson:"risk"`
 
 	// Extra preserves every stored key this struct does not name — see
 	// the long note on subdomain.Subdomain.Extra. A merge rewrites the
@@ -21,8 +23,9 @@ type Port struct {
 // HostGroup is one host's open ports — the element type of
 // CTEMData.openPorts.
 type HostGroup struct {
-	Host       string `json:"host" bson:"host"`
-	IP         string `json:"ip,omitempty" bson:"ip,omitempty"`
+	Host string `json:"host" bson:"host"`
+	// Always emitted, as '' when nothing resolved — see Port.Version.
+	IP         string `json:"ip,omitempty" bson:"ip"`
 	Ports      []Port `json:"ports" bson:"ports"`
 	RootDomain string `json:"rootDomain,omitempty" bson:"rootDomain,omitempty"`
 
