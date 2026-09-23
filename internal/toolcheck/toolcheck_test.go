@@ -27,6 +27,14 @@ func TestPresent_AbsolutePathAndPATHLookup(t *testing.T) {
 	if Present("") {
 		t.Errorf("an empty path should never be present")
 	}
+
+	nonexec := filepath.Join(dir, "nonexec")
+	if err := os.WriteFile(nonexec, []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if Present(nonexec) {
+		t.Errorf("a non-executable file should not be present")
+	}
 }
 
 func TestCheck_ReportsPerTool(t *testing.T) {

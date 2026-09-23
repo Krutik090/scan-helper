@@ -18,7 +18,7 @@ func Present(binPath string) bool {
 	}
 	if strings.ContainsRune(binPath, os.PathSeparator) {
 		info, err := os.Stat(binPath)
-		return err == nil && !info.IsDir()
+		return err == nil && !info.IsDir() && info.Mode()&0111 != 0
 	}
 	_, err := exec.LookPath(binPath)
 	return err == nil

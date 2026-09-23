@@ -18,17 +18,20 @@ func (f fakeModule) Run(context.Context, RunParams, func(int)) (any, error) {
 
 func TestRegistry_RegisterGetNamesAreStable(t *testing.T) {
 	r := NewRegistry()
-	r.Register(fakeModule{name: "subdomains", tools: []ToolRequirement{{Name: "amass", BinPath: "/usr/bin/amass"}}})
-	r.Register(fakeModule{name: "ports", tools: []ToolRequirement{{Name: "nmap", BinPath: "/usr/bin/nmap"}}})
+	r.Register(fakeModule{name: "zulu", tools: []ToolRequirement{}})
+	r.Register(fakeModule{name: "alpha", tools: []ToolRequirement{}})
+	r.Register(fakeModule{name: "mike", tools: []ToolRequirement{}})
+	r.Register(fakeModule{name: "bravo", tools: []ToolRequirement{}})
+	r.Register(fakeModule{name: "yankee", tools: []ToolRequirement{}})
 
-	if _, ok := r.Get("ports"); !ok {
-		t.Fatal("ports should be registered")
+	if _, ok := r.Get("alpha"); !ok {
+		t.Fatal("alpha should be registered")
 	}
 	if _, ok := r.Get("nope"); ok {
 		t.Fatal("unregistered module should not resolve")
 	}
 	names := r.Names()
-	if len(names) != 2 || names[0] != "subdomains" || names[1] != "ports" {
+	if len(names) != 5 || names[0] != "zulu" || names[1] != "alpha" || names[2] != "mike" || names[3] != "bravo" || names[4] != "yankee" {
 		t.Fatalf("Names() should preserve registration order, got %v", names)
 	}
 }
