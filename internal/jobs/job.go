@@ -54,6 +54,11 @@ func (s *Store) Create(job *Job) {
 	s.jobs[job.ID] = job
 }
 
+// Get returns a live pointer to the job without copying. Safe only for
+// existence checks (e.g., if _, exists := s.Get(id); exists {...}).
+// Do NOT read fields off the returned pointer — concurrent SetCount, SetStatus,
+// and other mutations hold s.mu.Lock() while modifying the same struct, causing
+// races. Callers that need to read or serialize a job must use Snapshot instead.
 func (s *Store) Get(id string) (*Job, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
