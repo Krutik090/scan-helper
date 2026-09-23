@@ -100,8 +100,15 @@ func (s *Server) runJob(module modules.Module, jobID string, params modules.RunP
 		}
 	}()
 
+	// Announce the job as running BEFORE the module starts, so the
+	// external backend polling by jobId sees a row for the minutes a scan
+	// takes — and so a process killed mid-scan leaves a diagnosable
+	// "running" row rather than no row at all.
+	s.announce(jobID, logger, s.deps.Sink.Start, "recording the job as running failed")
+
 	result, err := module.Run(context.Background(), params, func(count int) {
 		s.deps.Jobs.SetCount(jobID, count)
+		s.announce(jobID, logger, s.deps.Sink.Progress, "recording scan progress failed")
 	})
 	if err != nil {
 		logger.Error("scan failed", "error", err)
@@ -115,6 +122,25 @@ func (s *Server) runJob(module modules.Module, jobID string, params modules.RunP
 	s.deps.Jobs.SetStatus(jobID, jobs.StatusComplete)
 	logger.Info("scan complete")
 	s.persist(jobID, logger)
+}
+
+// announce runs one of the sink's non-terminal lifecycle writes (Start,
+// Progress). Unlike persist, a failure here is LOGGED AND DROPPED: it
+// never touches the job's status and never aborts the scan. Losing
+// progress reporting is not a reason to fail a scan that is working —
+// the terminal Save still has to succeed, and still reports if it
+// doesn't.
+func (s *Server) announce(jobID string, logger loggerLike, write func(context.Context, jobs.Job) error, what string) {
+	snapshot, ok := s.deps.Jobs.Snapshot(jobID)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := write(ctx, snapshot); err != nil {
+		logger.Error(what, "error", err)
+	}
 }
 
 // persist hands the finished job to the configured sink. A storage

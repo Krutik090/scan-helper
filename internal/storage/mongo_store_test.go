@@ -323,6 +323,96 @@ func TestMongoSink_UnknownStoredFieldsSurviveAPortMerge(t *testing.T) {
 	}
 }
 
+// TestMongoSink_JobIsVisibleWhileItRuns covers the lifecycle the external
+// backend polls: a ScanJob row exists as "running" from the moment the
+// scan starts, its count moves while the scan is under way, and only
+// then does it go terminal.
+func TestMongoSink_JobIsVisibleWhileItRuns(t *testing.T) {
+	sink := testMongo(t)
+	ctx := context.Background()
+	tenant := "6a7dc0f5458d051280d196c2"
+
+	job := jobs.Job{
+		ID: "job-lifecycle", Module: "ports", TenantID: tenant, Domain: "acme.test",
+		Status: jobs.StatusRunning, StartedAt: time.Now(),
+	}
+
+	if err := sink.Start(ctx, job); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	running := readScanJob(t, sink, "job-lifecycle")
+	if running.Status != string(jobs.StatusRunning) {
+		t.Fatalf("status = %q, want running — the backend polls this row for the whole scan", running.Status)
+	}
+	if running.StartedAt == nil || running.StartedAt.IsZero() {
+		t.Error("a running job must carry startedAt")
+	}
+	if running.Type != "openPorts" {
+		t.Errorf("type = %q, want openPorts", running.Type)
+	}
+	if running.CompletedAt != nil {
+		t.Error("a running job must not carry completedAt yet")
+	}
+	if running.CreatedAt == nil || running.UpdatedAt == nil {
+		t.Fatalf("both Mongoose timestamps must be written: %+v", running)
+	}
+	createdAt := *running.CreatedAt
+
+	// Progress moves the count on the same row.
+	job.Count = 7
+	if err := sink.Progress(ctx, job); err != nil {
+		t.Fatalf("Progress: %v", err)
+	}
+	progressed := readScanJob(t, sink, "job-lifecycle")
+	if progressed.Count != 7 {
+		t.Errorf("count = %d, want 7 — progress must be visible before the scan ends", progressed.Count)
+	}
+	if progressed.Status != string(jobs.StatusRunning) {
+		t.Errorf("status = %q, want running — Progress must not change it", progressed.Status)
+	}
+
+	// And Save then takes it terminal, without moving createdAt.
+	job.Count = 9
+	job.Status = jobs.StatusComplete
+	job.Result = portscan.Result{Domain: "acme.test"}
+	if err := sink.Save(ctx, job); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	done := readScanJob(t, sink, "job-lifecycle")
+	if done.Status != string(jobs.StatusComplete) || done.Count != 9 {
+		t.Fatalf("terminal row = %+v", done)
+	}
+	if done.CompletedAt == nil {
+		t.Error("a complete job must stamp completedAt")
+	}
+	if done.CreatedAt == nil || !done.CreatedAt.Equal(createdAt) {
+		t.Errorf("createdAt moved: %v then %v — it is written on insert only", createdAt, done.CreatedAt)
+	}
+	if done.UpdatedAt == nil || done.UpdatedAt.Before(createdAt) {
+		t.Errorf("updatedAt = %v, want a stamp from this write", done.UpdatedAt)
+	}
+}
+
+// TestMongoSink_ProgressWithoutStartCreatesNothing pins the deliberate
+// non-upsert: a count-only row would read to a poller as a job with no
+// status at all.
+func TestMongoSink_ProgressWithoutStartCreatesNothing(t *testing.T) {
+	sink := testMongo(t)
+	ctx := context.Background()
+
+	job := jobs.Job{ID: "job-no-start", Module: "ports", TenantID: "6a7dc0f5458d051280d196c3", Count: 4}
+	if err := sink.Progress(ctx, job); err != nil {
+		t.Fatalf("Progress on an absent row must be a quiet no-op: %v", err)
+	}
+	n, err := sink.db.Collection("ScanJob").CountDocuments(ctx, bson.M{"jobId": "job-no-start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("Progress created %d row(s); it must never create one", n)
+	}
+}
+
 // unrecognisedResult is neither subdomain.Result nor portscan.Result, so
 // saveResult hits its default branch.
 type unrecognisedResult struct {

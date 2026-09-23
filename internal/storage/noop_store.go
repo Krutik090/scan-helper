@@ -12,5 +12,7 @@ type noopSink struct{}
 // the job store, so there is nothing to persist.
 func NewNoop() Sink { return noopSink{} }
 
-func (noopSink) Save(context.Context, jobs.Job) error { return nil }
-func (noopSink) Close(context.Context) error          { return nil }
+func (noopSink) Start(context.Context, jobs.Job) error    { return nil }
+func (noopSink) Progress(context.Context, jobs.Job) error { return nil }
+func (noopSink) Save(context.Context, jobs.Job) error     { return nil }
+func (noopSink) Close(context.Context) error              { return nil }

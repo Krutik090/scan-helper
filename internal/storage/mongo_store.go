@@ -28,6 +28,10 @@ type ScanJobDoc struct {
 	Error       string             `bson:"error,omitempty"`
 	StartedAt   *time.Time         `bson:"startedAt,omitempty"`
 	CompletedAt *time.Time         `bson:"completedAt,omitempty"`
+	// Mongoose's {timestamps:true} put these on every ScanJob; the
+	// backend has read them since, so they are part of the contract.
+	CreatedAt *time.Time `bson:"createdAt,omitempty"`
+	UpdatedAt *time.Time `bson:"updatedAt,omitempty"`
 }
 
 // ctemDoc is the slice of CTEMData this tool reads and writes. Other
@@ -86,6 +90,40 @@ func databaseName(uri string) (string, error) {
 
 func (m *MongoSink) Close(ctx context.Context) error {
 	return m.client.Disconnect(ctx)
+}
+
+// Start writes the "running" ScanJob row, before the module is invoked.
+// The ThreatIntel backend polls this row by jobId; until this existed it
+// saw nothing for the whole duration of a scan, and a process that died
+// mid-scan left no trace of the job at all.
+func (m *MongoSink) Start(ctx context.Context, job jobs.Job) error {
+	tenantID, err := primitive.ObjectIDFromHex(job.TenantID)
+	if err != nil {
+		return fmt.Errorf("tenantId %q is not an ObjectID: %w", job.TenantID, err)
+	}
+	started := job.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	return m.updateScanJob(ctx, job.ID, bson.M{
+		"jobId":     job.ID,
+		"tenantId":  tenantID,
+		"domain":    job.Domain,
+		"type":      scanJobType[job.Module],
+		"status":    string(jobs.StatusRunning),
+		"count":     job.Count,
+		"startedAt": started,
+	}, true)
+}
+
+// Progress moves the running row's count as findings accumulate — the
+// "so frontend polling shows progress" write index.js did per batch.
+//
+// Deliberately NOT an upsert: if Start failed, this must not conjure a
+// row carrying a count and nothing else, which a poller would read as a
+// job with no status. Save still creates the row at the end.
+func (m *MongoSink) Progress(ctx context.Context, job jobs.Job) error {
+	return m.updateScanJob(ctx, job.ID, bson.M{"count": job.Count}, false)
 }
 
 // Save writes the job's ScanJob document and, for a complete job, merges
@@ -153,15 +191,31 @@ func (m *MongoSink) saveScanJob(ctx context.Context, tenantID primitive.ObjectID
 	if completedAt := completedAtFor(job); completedAt != nil {
 		doc["completedAt"] = *completedAt
 	}
+	return m.updateScanJob(ctx, job.ID, doc, true)
+}
+
+// updateScanJob is the single ScanJob write path. Every write stamps
+// updatedAt and, on the insert that creates the row, createdAt: Mongoose
+// put both on the collection with {timestamps:true} and the backend has
+// read them ever since, so the Go rewrite has to keep writing them.
+// createdAt goes through $setOnInsert so a later write never moves it.
+func (m *MongoSink) updateScanJob(ctx context.Context, jobID string, set bson.M, upsert bool) error {
+	now := time.Now()
+	set["updatedAt"] = now
+
+	update := bson.M{"$set": set}
+	if upsert {
+		update["$setOnInsert"] = bson.M{"createdAt": now}
+	}
 
 	_, err := m.db.Collection("ScanJob").UpdateOne(
 		ctx,
-		bson.M{"jobId": job.ID},
-		bson.M{"$set": doc},
-		options.Update().SetUpsert(true),
+		bson.M{"jobId": jobID},
+		update,
+		options.Update().SetUpsert(upsert),
 	)
 	if err != nil {
-		return fmt.Errorf("writing ScanJob %s: %w", job.ID, err)
+		return fmt.Errorf("writing ScanJob %s: %w", jobID, err)
 	}
 	return nil
 }

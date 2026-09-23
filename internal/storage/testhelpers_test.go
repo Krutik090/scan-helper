@@ -88,6 +88,17 @@ func rawArray(t *testing.T, sink *MongoSink, tenant, field string) []bson.M {
 	return out
 }
 
+func readScanJob(t *testing.T, sink *MongoSink, jobID string) ScanJobDoc {
+	t.Helper()
+	var doc ScanJobDoc
+	if err := sink.db.Collection("ScanJob").FindOne(
+		context.Background(), bson.M{"jobId": jobID},
+	).Decode(&doc); err != nil {
+		t.Fatalf("reading ScanJob %s: %v", jobID, err)
+	}
+	return doc
+}
+
 func asString(v any) string {
 	s, _ := v.(string)
 	return s

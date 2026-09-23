@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,7 +44,57 @@ func (s stubModule) Run(ctx context.Context, _ modules.RunParams, onProgress fun
 	return s.result, s.err
 }
 
+// recordingSink counts the sink's lifecycle calls and can be told to
+// fail the non-terminal ones.
+type recordingSink struct {
+	mu                  sync.Mutex
+	starts              int
+	progress            int
+	saves               int
+	failStartAndProgres bool
+}
+
+func (r *recordingSink) Start(context.Context, jobs.Job) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.starts++
+	if r.failStartAndProgres {
+		return errors.New("mongo is down")
+	}
+	return nil
+}
+
+func (r *recordingSink) Progress(context.Context, jobs.Job) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.progress++
+	if r.failStartAndProgres {
+		return errors.New("mongo is down")
+	}
+	return nil
+}
+
+func (r *recordingSink) Save(context.Context, jobs.Job) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.saves++
+	return nil
+}
+
+func (r *recordingSink) Close(context.Context) error { return nil }
+
+func (r *recordingSink) counts() (int, int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.starts, r.progress, r.saves
+}
+
 func testServer(t *testing.T, mode config.Mode, mod modules.Module) *Server {
+	t.Helper()
+	return testServerWithSink(t, mode, mod, storage.NewNoop())
+}
+
+func testServerWithSink(t *testing.T, mode config.Mode, mod modules.Module, sink storage.Sink) *Server {
 	t.Helper()
 	reg := modules.NewRegistry()
 	reg.Register(mod)
@@ -54,7 +106,7 @@ func testServer(t *testing.T, mode config.Mode, mod modules.Module) *Server {
 		},
 		Registry: reg,
 		Jobs:     jobs.NewStore(),
-		Sink:     storage.NewNoop(),
+		Sink:     sink,
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 }
@@ -178,6 +230,53 @@ func TestScan_FailingModuleMarksJobFailed(t *testing.T) {
 	job := waitForTerminal(t, srv, accepted.JobID)
 	if job.Status != string(jobs.StatusFailed) || job.Error == "" {
 		t.Fatalf("job = %+v", job)
+	}
+}
+
+func TestScan_ReportsTheJobAsRunningAndThenProgresses(t *testing.T) {
+	sink := &recordingSink{}
+	srv := testServerWithSink(t, config.ModeMongo, stubModule{
+		name:   "subdomains",
+		result: map[string]any{"domain": "acme.test"},
+	}, sink)
+
+	rec := post(t, srv, "/api/v1/scans/subdomains", "test-key", ScanRequest{Domain: "acme.test", TenantID: "6a7dc0f5458d051280d196ad"})
+	var accepted ScanAccepted
+	_ = json.Unmarshal(rec.Body.Bytes(), &accepted)
+	waitForTerminal(t, srv, accepted.JobID)
+
+	starts, progress, saves := sink.counts()
+	if starts != 1 {
+		t.Errorf("Start called %d times, want 1 — the backend polls for a running row", starts)
+	}
+	if progress != 1 {
+		t.Errorf("Progress called %d times, want 1 (the stub reports once)", progress)
+	}
+	if saves != 1 {
+		t.Errorf("Save called %d times, want 1", saves)
+	}
+}
+
+func TestScan_LifecycleWriteFailureDoesNotAbortTheScan(t *testing.T) {
+	sink := &recordingSink{failStartAndProgres: true}
+	srv := testServerWithSink(t, config.ModeMongo, stubModule{
+		name:   "subdomains",
+		result: map[string]any{"domain": "acme.test"},
+	}, sink)
+
+	rec := post(t, srv, "/api/v1/scans/subdomains", "test-key", ScanRequest{Domain: "acme.test", TenantID: "6a7dc0f5458d051280d196ad"})
+	var accepted ScanAccepted
+	_ = json.Unmarshal(rec.Body.Bytes(), &accepted)
+
+	job := waitForTerminal(t, srv, accepted.JobID)
+	if job.Status != string(jobs.StatusComplete) {
+		t.Fatalf("a failed progress write must not fail a working scan: %+v", job)
+	}
+	if job.Error != "" {
+		t.Errorf("a failed progress write must not be recorded on the job: %q", job.Error)
+	}
+	if _, _, saves := sink.counts(); saves != 1 {
+		t.Errorf("the terminal Save must still run: %d", saves)
 	}
 }
 

@@ -9,9 +9,15 @@ import (
 
 func TestNoopSink_SavesNothingAndNeverFails(t *testing.T) {
 	sink := NewNoop()
-	err := sink.Save(context.Background(), jobs.Job{ID: "j1", Module: "subdomains", Status: jobs.StatusComplete})
-	if err != nil {
-		t.Fatalf("the no-op sink must never fail: %v", err)
+	job := jobs.Job{ID: "j1", Module: "subdomains", Status: jobs.StatusComplete}
+	for name, write := range map[string]func(context.Context, jobs.Job) error{
+		"Start":    sink.Start,
+		"Progress": sink.Progress,
+		"Save":     sink.Save,
+	} {
+		if err := write(context.Background(), job); err != nil {
+			t.Fatalf("the no-op sink must never fail: %s: %v", name, err)
+		}
 	}
 	if err := sink.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
