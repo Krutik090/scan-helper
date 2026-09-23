@@ -22,6 +22,27 @@ type Subdomain struct {
 	AddedBy          string     `json:"addedBy,omitempty" bson:"addedBy,omitempty"`
 	LastCheckedAt    *time.Time `json:"lastCheckedAt,omitempty" bson:"lastCheckedAt,omitempty"`
 	CheckError       string     `json:"checkError,omitempty" bson:"checkError,omitempty"`
+
+	// Extra is the catch-all for every key of a stored row this struct
+	// does not name — `_id` above all, but also anything the ThreatIntel
+	// platform has added to a row since this tool was written. Without
+	// it, decoding a row into this struct and writing the struct back
+	// would silently delete those keys: the merge rewrites the WHOLE
+	// subdomains array, so a row that merely passes through is re-encoded
+	// from whatever the struct captured.
+	//
+	// `bson:",inline"` splices the map's keys into the same document
+	// rather than nesting them under a field. The driver refuses to
+	// encode a key here that collides with a named field above, and never
+	// decodes a named field's key into here, so the two can't fight.
+	//
+	// `json:"-"` keeps this storage plumbing out of the API response.
+	//
+	// A plain map (rather than bson.M) keeps the Mongo driver out of the
+	// module packages, which the package doc for internal/modules
+	// forbids; the driver only requires an inline field to be a map with
+	// string keys.
+	Extra map[string]any `json:"-" bson:",inline"`
 }
 
 // Result is what Run returns: this run's discovered and resolved

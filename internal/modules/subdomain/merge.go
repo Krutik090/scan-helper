@@ -122,6 +122,12 @@ func Merge(existing, fresh []Subdomain, domain string, now time.Time) MergeResul
 		entry.AddedBy = stored.AddedBy
 		entry.LastCheckedAt = stored.LastCheckedAt
 		entry.CheckError = stored.CheckError
+		// Everything the stored row carried that this struct does not
+		// name — `_id` first of all. An updated entry is built fresh from
+		// the scan result, so without this line the round trip through
+		// Mongo would drop those keys. Kept and retained entries pass
+		// through whole and carry theirs already.
+		entry.Extra = stored.Extra
 		if entry.Source == "" {
 			entry.Source = "scan"
 		}

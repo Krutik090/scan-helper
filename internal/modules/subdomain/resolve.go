@@ -103,7 +103,13 @@ func fillMissingIPs(ctx context.Context, subs []Subdomain, workers int, resolve 
 	for i, s := range subs {
 		if s.IP == "" {
 			if got, ok := resolved[s.Sub]; ok {
-				out[i] = got
+				// Copy the two resolved fields onto the existing entry
+				// rather than replacing it with the pool's bare result:
+				// replacing would discard every other field the entry
+				// already carried.
+				s.IP = got.IP
+				s.Status = got.Status
+				out[i] = s
 				continue
 			}
 			s.Status = "Inactive"

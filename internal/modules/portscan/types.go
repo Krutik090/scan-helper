@@ -9,6 +9,13 @@ type Port struct {
 	Version  string `json:"version,omitempty" bson:"version,omitempty"`
 	State    string `json:"state" bson:"state"`
 	Risk     string `json:"risk" bson:"risk"`
+
+	// Extra preserves every stored key this struct does not name — see
+	// the long note on subdomain.Subdomain.Extra. A merge rewrites the
+	// whole openPorts array, so without this a port row that merely
+	// passes through would come back shorn of its `_id` and of anything
+	// the platform has added to it.
+	Extra map[string]any `json:"-" bson:",inline"`
 }
 
 // HostGroup is one host's open ports — the element type of
@@ -18,6 +25,10 @@ type HostGroup struct {
 	IP         string `json:"ip,omitempty" bson:"ip,omitempty"`
 	Ports      []Port `json:"ports" bson:"ports"`
 	RootDomain string `json:"rootDomain,omitempty" bson:"rootDomain,omitempty"`
+
+	// Extra preserves every stored key this struct does not name,
+	// starting with `_id` — see subdomain.Subdomain.Extra.
+	Extra map[string]any `json:"-" bson:",inline"`
 }
 
 // Result is what Run returns: every host in scope that had at least one

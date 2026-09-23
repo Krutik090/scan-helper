@@ -10,6 +10,7 @@ import (
 	"github.com/Krutik090/scan-helper/internal/modules/portscan"
 	"github.com/Krutik090/scan-helper/internal/modules/subdomain"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // These run only when a MongoDB is reachable. Set SCAN_HELPER_TEST_MONGO_URI
@@ -167,6 +168,158 @@ func TestMongoSink_TargetsComeFromStoredSubdomains(t *testing.T) {
 	}
 	if len(targets) != 2 {
 		t.Fatalf("want the root plus its one in-domain subdomain, got %+v", targets)
+	}
+}
+
+// TestMongoSink_UnknownStoredFieldsSurviveAMerge is the regression test
+// for the typed-decode data loss: a merge decodes the stored rows into Go
+// structs and writes the WHOLE array back, so any key the structs do not
+// name would be dropped from every row that merely passes through —
+// `_id` included, along with anything the ThreatIntel platform has added
+// to a row since. The rows are seeded as raw BSON and read back as raw
+// BSON, because a typed read would hide exactly the loss being tested.
+func TestMongoSink_UnknownStoredFieldsSurviveAMerge(t *testing.T) {
+	sink := testMongo(t)
+	ctx := context.Background()
+	tenant := "6a7dc0f5458d051280d196c0"
+
+	rescannedID := primitive.NewObjectID()
+	untouchedID := primitive.NewObjectID()
+	otherDomainID := primitive.NewObjectID()
+
+	seedRawCTEM(t, sink, tenant, bson.M{"subdomains": bson.A{
+		// This one the scan finds again: Merge rebuilds it from the scan
+		// result, so it only keeps its _id if Merge copies Extra across.
+		bson.M{
+			"_id": rescannedID, "sub": "www.acme.test", "ip": "1.1.1.1", "status": "Active",
+			"assetCriticality": "High", "platformNote": "keep me",
+		},
+		// This one the scan does not return: retained, must pass through whole.
+		bson.M{
+			"_id": untouchedID, "sub": "vpn.acme.test", "ip": "", "status": "Pending",
+			"source": "client-request", "platformNote": "keep me",
+		},
+		// Another root domain entirely: kept, must pass through whole.
+		bson.M{
+			"_id": otherDomainID, "sub": "shop.acme.co", "ip": "2.2.2.2", "status": "Active",
+			"platformNote": "keep me",
+		},
+	}})
+
+	job := jobs.Job{
+		ID: "job-extra-subs", Module: "subdomains", TenantID: tenant, Domain: "acme.test",
+		Status: jobs.StatusComplete, Count: 1,
+		Result: subdomain.Result{Domain: "acme.test", Subdomains: []subdomain.Subdomain{
+			{Sub: "www.acme.test", IP: "9.9.9.9", Status: "Active"},
+		}},
+	}
+	if err := sink.Save(ctx, job); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	rows := rawArray(t, sink, tenant, "subdomains")
+	bySub := map[string]bson.M{}
+	for _, r := range rows {
+		bySub[asString(r["sub"])] = r
+	}
+	if len(rows) != 3 {
+		t.Fatalf("want 3 rows back, got %d: %+v", len(rows), rows)
+	}
+
+	for _, tc := range []struct {
+		sub  string
+		id   primitive.ObjectID
+		what string
+	}{
+		{"vpn.acme.test", untouchedID, "a row the scan did not return (retained)"},
+		{"shop.acme.co", otherDomainID, "a row of another root domain (kept)"},
+		{"www.acme.test", rescannedID, "a row the scan found again (updated)"},
+	} {
+		row, ok := bySub[tc.sub]
+		if !ok {
+			t.Errorf("%s vanished from the array: %s", tc.sub, tc.what)
+			continue
+		}
+		if got, _ := row["_id"].(primitive.ObjectID); got != tc.id {
+			t.Errorf("%s (%s): _id = %v, want %v — the platform addresses rows by _id", tc.sub, tc.what, row["_id"], tc.id)
+		}
+		if row["platformNote"] != "keep me" {
+			t.Errorf("%s (%s): platformNote = %v, want %q — an unknown field must survive the round trip",
+				tc.sub, tc.what, row["platformNote"], "keep me")
+		}
+	}
+	// The merge must still have done its actual job.
+	if bySub["www.acme.test"]["ip"] != "9.9.9.9" {
+		t.Errorf("the rescanned row should carry the fresh ip: %+v", bySub["www.acme.test"])
+	}
+	if bySub["www.acme.test"]["assetCriticality"] != "High" {
+		t.Errorf("the rescanned row must keep its admin-owned criticality: %+v", bySub["www.acme.test"])
+	}
+}
+
+func TestMongoSink_UnknownStoredFieldsSurviveAPortMerge(t *testing.T) {
+	sink := testMongo(t)
+	ctx := context.Background()
+	tenant := "6a7dc0f5458d051280d196c1"
+
+	keptID := primitive.NewObjectID()
+	keptPortID := primitive.NewObjectID()
+
+	seedRawCTEM(t, sink, tenant, bson.M{"openPorts": bson.A{
+		// Belongs to acme.test, so this run replaces it — nothing to preserve.
+		bson.M{"_id": primitive.NewObjectID(), "host": "www.acme.test", "ports": bson.A{
+			bson.M{"port": 22, "protocol": "tcp", "service": "ssh", "state": "Open", "risk": "Low"},
+		}},
+		// Another root domain: kept untouched, down to its nested port row.
+		bson.M{
+			"_id": keptID, "host": "shop.acme.co", "ip": "2.2.2.2", "platformNote": "keep me",
+			"ports": bson.A{
+				bson.M{
+					"_id": keptPortID, "port": 80, "protocol": "tcp", "service": "http",
+					"state": "Open", "risk": "Low", "platformNote": "keep me",
+				},
+			},
+		},
+	}})
+
+	job := jobs.Job{
+		ID: "job-extra-ports", Module: "ports", TenantID: tenant, Domain: "acme.test",
+		Status: jobs.StatusComplete, Count: 1,
+		Result: portscan.Result{Domain: "acme.test", HostGroups: []portscan.HostGroup{
+			{Host: "www.acme.test", Ports: []portscan.Port{{Port: 443, State: "Open", Risk: "Low"}}, RootDomain: "acme.test"},
+		}},
+	}
+	if err := sink.Save(ctx, job); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	rows := rawArray(t, sink, tenant, "openPorts")
+	var kept bson.M
+	for _, r := range rows {
+		if asString(r["host"]) == "shop.acme.co" {
+			kept = r
+		}
+	}
+	if kept == nil {
+		t.Fatalf("the other domain's host group vanished: %+v", rows)
+	}
+	if got, _ := kept["_id"].(primitive.ObjectID); got != keptID {
+		t.Errorf("kept host group _id = %v, want %v", kept["_id"], keptID)
+	}
+	if kept["platformNote"] != "keep me" {
+		t.Errorf("kept host group platformNote = %v, want %q", kept["platformNote"], "keep me")
+	}
+
+	ports, _ := kept["ports"].(primitive.A)
+	if len(ports) != 1 {
+		t.Fatalf("kept host group should still hold its one port: %+v", kept["ports"])
+	}
+	port, _ := ports[0].(bson.M)
+	if got, _ := port["_id"].(primitive.ObjectID); got != keptPortID {
+		t.Errorf("kept port _id = %v, want %v — nested rows are re-encoded too", port["_id"], keptPortID)
+	}
+	if port["platformNote"] != "keep me" {
+		t.Errorf("kept port platformNote = %v, want %q", port["platformNote"], "keep me")
 	}
 }
 
