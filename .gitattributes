@@ -1,1 +1,4 @@
 *.sh text eol=lf
+
+# Captured tool output — keep byte-exact, do not translate line endings.
+internal/modules/portscan/testdata/*.xml -text
